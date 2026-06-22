@@ -1,0 +1,5 @@
+.env
+node_modules
+dist
+recordings/*
+package-lock.json
