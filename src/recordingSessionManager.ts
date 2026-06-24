@@ -670,6 +670,15 @@ export class RecordingSessionManager {
 
   private async collectAudioFromPage(page: Page): Promise<Buffer | null> {
     try {
+      await page.evaluate(async () => {
+        const resume = (window as Window & {
+          __resumeRecordingBotAudio?: () => Promise<void>;
+        }).__resumeRecordingBotAudio;
+        if (typeof resume === 'function') {
+          await resume();
+        }
+      });
+
       const base64Audio = await page.evaluate(async () => {
         const stop = (window as Window & {
           __stopRecordingBotAudio?: () => Promise<string | null>;
@@ -685,7 +694,11 @@ export class RecordingSessionManager {
         return null;
       }
 
-      return Buffer.from(base64Audio, 'base64');
+      const audioBuffer = Buffer.from(base64Audio, 'base64');
+      console.log(
+        `[RecordingWorker] Collected page audio (${audioBuffer.length} bytes)`,
+      );
+      return audioBuffer;
     } catch (err) {
       console.warn('[RecordingWorker] Failed to collect page audio:', err);
       return null;
