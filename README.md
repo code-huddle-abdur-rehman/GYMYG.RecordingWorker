@@ -22,12 +22,17 @@ npm run dev
 | `WORKOUT_PATH` | Path to workout page (default `/workout`) |
 | `BUCKET_NAME` | S3 bucket for uploads |
 | `CLASS_RECORDING_PREFIX` | S3 key prefix (default `classRecordings`) |
+| `EMAIL` / `PASSWORD` | Dedicated **client** account for the client recording bot |
+| `CORPORATE_EMAIL` / `CORPORATE_PASSWORD` | **Admin** account for corporate trainer/coach mirror bots |
 
 ## Queues
 
-- `class-recording-start` — opens **one** Playwright context (client perspective only)
-- `class-recording-stop` — closes the client context, uploads video to S3, notifies API
+- `class-recording-start` — opens up to **three** Playwright contexts per class:
+  - **Client** — joins immediately via recording bot token
+  - **Trainer** — waits up to 5 minutes for the assigned trainer to join, then opens corporate admin mirror view (`?role=trainer`)
+  - **Coach** — waits up to 5 minutes for the assigned coach to join, then opens corporate admin mirror view (`?role=coach1` or `coach2`)
+- `class-recording-stop` — closes all contexts, uploads videos to S3, notifies API
 
-Trainer and coach perspectives are recorded from their **real browser sessions** in the web app (not worker bots).
+If trainer or coach never joins within 5 minutes, that perspective is skipped and marked failed; the client recording continues independently.
 
-Deploy separately from the main NestJS EC2 instance (e.g. ECS Fargate).
+Deploy separately from the main NestJS EC2 instance (e.g. ECS Fargate). Plan for ~2GB+ RAM per active recorded class (3 browser contexts).

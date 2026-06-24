@@ -116,4 +116,4 @@ new Worker(
   { connection, concurrency: 1 },
 );
 
-console.log('[RecordingWorker] Listening for recording jobs (client bot only)');
+console.log('[RecordingWorker] Listening for recording jobs (client + corporate trainer/coach bots)');
