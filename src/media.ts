@@ -18,19 +18,37 @@ export async function muxVideoWithAudio(
   outputPath: string,
 ): Promise<void> {
   const ffmpeg = getFfmpegPath();
-  await execFileAsync(ffmpeg, [
-    '-y',
-    '-i',
-    videoPath,
-    '-i',
-    audioPath,
-    '-c:v',
-    'copy',
-    '-c:a',
-    'copy',
-    '-shortest',
-    outputPath,
-  ]);
+  try {
+    await execFileAsync(ffmpeg, [
+      '-y',
+      '-i',
+      videoPath,
+      '-i',
+      audioPath,
+      '-c:v',
+      'copy',
+      '-c:a',
+      'copy',
+      '-shortest',
+      outputPath,
+    ]);
+  } catch {
+    await execFileAsync(ffmpeg, [
+      '-y',
+      '-i',
+      videoPath,
+      '-i',
+      audioPath,
+      '-c:v',
+      'copy',
+      '-c:a',
+      'libopus',
+      '-b:a',
+      '128k',
+      '-shortest',
+      outputPath,
+    ]);
+  }
 }
 
 export async function writeTempFile(

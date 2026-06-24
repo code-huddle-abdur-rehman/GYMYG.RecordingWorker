@@ -7,6 +7,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { muxVideoWithAudio, removeFileIfExists, writeTempFile } from './media.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
+type StaffRole = 'trainer' | 'coach';
 
 interface JoinDetails {
   roomToken: string;
@@ -16,24 +17,37 @@ interface JoinDetails {
   webAppUrl: string;
 }
 
+interface StaffPresence {
+  trainerInCall: boolean;
+  coachInCall: boolean;
+  coachLiveViewRole: 'coach1' | 'coach2' | null;
+  leadTrainerUserId: string | null;
+  assignedCoachUserId: string | null;
+  participantUserIds?: string[];
+}
+
 interface ActiveSession {
   entries: Array<{ context: BrowserContext; page: Page; perspective: Perspective }>;
   browser: Browser;
+  corporateSetupPromise: Promise<void>;
 }
 
-interface ClientAuthSession {
+interface AuthSession {
   accessToken: string;
   refreshToken: string;
   user: Record<string, unknown>;
 }
 
-interface ClientLoginResponse {
+interface LoginResponse {
   tokens: {
     access_token: string;
     refresh_token: string;
   };
   user: Record<string, unknown>;
 }
+
+const STAFF_WAIT_TIMEOUT_MS = 300_000;
+const STAFF_POLL_INTERVAL_MS = 5_000;
 
 export class RecordingSessionManager {
   private activeSessions = new Map<number, ActiveSession>();
@@ -75,6 +89,17 @@ export class RecordingSessionManager {
     return { email, password };
   }
 
+  private getCorporateCredentials(): { email: string; password: string } {
+    const email = process.env.CORPORATE_EMAIL?.trim();
+    const password = process.env.CORPORATE_PASSWORD;
+    if (!email || !password) {
+      throw new Error(
+        'CORPORATE_EMAIL and CORPORATE_PASSWORD must be set for trainer/coach recording bots.',
+      );
+    }
+    return { email, password };
+  }
+
   private filterUserData(user: Record<string, unknown>): Record<string, unknown> {
     const allowedKeys = [
       'userId',
@@ -99,9 +124,13 @@ export class RecordingSessionManager {
     );
   }
 
-  private async loginRecordingBot(): Promise<ClientAuthSession> {
-    const { email, password } = this.getRecordingBotCredentials();
-    const resp = await fetch(`${this.apiBase}/users/clientLogin`, {
+  private async loginWithEndpoint(
+    endpoint: string,
+    email: string,
+    password: string,
+    label: string,
+  ): Promise<AuthSession> {
+    const resp = await fetch(`${this.apiBase}/users/${endpoint}`, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -112,13 +141,13 @@ export class RecordingSessionManager {
 
     if (!resp.ok) {
       throw new Error(
-        `Recording bot client login failed: ${resp.status} ${await resp.text()}`,
+        `${label} login failed: ${resp.status} ${await resp.text()}`,
       );
     }
 
-    const data = (await resp.json()) as ClientLoginResponse;
+    const data = (await resp.json()) as LoginResponse;
     if (!data.tokens?.access_token || !data.tokens?.refresh_token || !data.user) {
-      throw new Error('Recording bot client login returned an invalid response.');
+      throw new Error(`${label} login returned an invalid response.`);
     }
 
     return {
@@ -128,9 +157,24 @@ export class RecordingSessionManager {
     };
   }
 
+  private async loginRecordingBot(): Promise<AuthSession> {
+    const { email, password } = this.getRecordingBotCredentials();
+    return this.loginWithEndpoint('clientLogin', email, password, 'Recording bot client');
+  }
+
+  private async loginCorporate(): Promise<AuthSession> {
+    const { email, password } = this.getCorporateCredentials();
+    return this.loginWithEndpoint(
+      'corporateAndInstructorLogin',
+      email,
+      password,
+      'Corporate recording bot',
+    );
+  }
+
   private async seedAuthSession(
     context: BrowserContext,
-    authSession: ClientAuthSession,
+    authSession: AuthSession,
   ): Promise<void> {
     await context.addInitScript((session) => {
       window.localStorage.setItem('accessToken', session.accessToken);
@@ -162,25 +206,38 @@ export class RecordingSessionManager {
         ],
       });
 
-      const perspectives: Perspective[] = ['client'];
-      const authSession = await this.loginRecordingBot();
+      const clientAuthSession = await this.loginRecordingBot();
       console.log('[RecordingWorker] Recording bot authenticated as client');
 
-      for (const perspective of perspectives) {
-        const joinDetails = await this.fetchJoinDetails(workoutClassId, perspective);
-        const entry = await this.openRecordingContext(
-          browser,
-          joinDetails,
-          workoutClassId,
-          perspective,
-          authSession,
-        );
-        entries.push(entry);
+      const clientJoinDetails = await this.fetchJoinDetails(workoutClassId, 'client');
+      const clientEntry = await this.openClientRecordingContext(
+        browser,
+        clientJoinDetails,
+        workoutClassId,
+        clientAuthSession,
+      );
+      entries.push(clientEntry);
+      console.log(`[RecordingWorker] Client browser session open for class ${workoutClassId}`);
+
+      if (!browser) {
+        throw new Error('Browser was unexpectedly closed after opening client context');
       }
 
-      this.activeSessions.set(workoutClassId, { browser, entries });
+      const session: ActiveSession = {
+        browser,
+        entries,
+        corporateSetupPromise: Promise.resolve(),
+      };
+      session.corporateSetupPromise = this.startCorporateRecordingBots(
+        workoutClassId,
+        session,
+      );
+      this.activeSessions.set(workoutClassId, session);
       browser = null;
-      console.log(`[RecordingWorker] Client browser session open for class ${workoutClassId}`);
+
+      console.log(
+        `[RecordingWorker] Client session registered for class ${workoutClassId}; corporate trainer/coach bots starting in background`,
+      );
     } catch (err) {
       await this.closeEntries(entries);
       if (browser) {
@@ -191,12 +248,103 @@ export class RecordingSessionManager {
     }
   }
 
+  private async startCorporateRecordingBots(
+    workoutClassId: number,
+    session: ActiveSession,
+  ): Promise<void> {
+    let corporateAuthSession: AuthSession | null = null;
+
+    const openPerspective = async (
+      perspective: 'trainer' | 'coach',
+      liveViewRole: string,
+    ) => {
+      if (!corporateAuthSession) {
+        corporateAuthSession = await this.loginCorporate();
+        console.log('[RecordingWorker] Corporate recording bot authenticated');
+      }
+      const entry = await this.openCorporateRecordingContext(
+        session.browser,
+        workoutClassId,
+        perspective,
+        liveViewRole,
+        corporateAuthSession,
+      );
+      session.entries.push(entry);
+      console.log(
+        `[RecordingWorker] ${perspective} corporate browser session open for class ${workoutClassId}`,
+      );
+    };
+
+    const trainerTask = (async () => {
+      try {
+        const presence = await this.waitForStaffPresence(
+          workoutClassId,
+          'trainer',
+          STAFF_WAIT_TIMEOUT_MS,
+        );
+        if (!presence) {
+          console.warn(
+            `[RecordingWorker] Trainer not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — skipping trainer recording`,
+          );
+          await this.notifyFailed(workoutClassId, 'trainer');
+          return;
+        }
+        await openPerspective('trainer', 'trainer');
+      } catch (err) {
+        console.error(
+          `[RecordingWorker] Failed to start trainer corporate bot for class ${workoutClassId}:`,
+          err,
+        );
+        await this.notifyFailed(workoutClassId, 'trainer');
+      }
+    })();
+
+    const coachTask = (async () => {
+      try {
+        const presence = await this.waitForStaffPresence(
+          workoutClassId,
+          'coach',
+          STAFF_WAIT_TIMEOUT_MS,
+        );
+        if (!presence?.coachLiveViewRole) {
+          console.warn(
+            `[RecordingWorker] Coach not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — skipping coach recording`,
+          );
+          await this.notifyFailed(workoutClassId, 'coach');
+          return;
+        }
+        await openPerspective('coach', presence.coachLiveViewRole);
+      } catch (err) {
+        console.error(
+          `[RecordingWorker] Failed to start coach corporate bot for class ${workoutClassId}:`,
+          err,
+        );
+        await this.notifyFailed(workoutClassId, 'coach');
+      }
+    })();
+
+    await Promise.all([trainerTask, coachTask]);
+    console.log(
+      `[RecordingWorker] Corporate setup finished for class ${workoutClassId}: ${session.entries.length} active context(s)`,
+    );
+  }
+
   async stopClassRecording(workoutClassId: number): Promise<void> {
     const session = this.activeSessions.get(workoutClassId);
     if (!session) {
       console.log(`[RecordingWorker] No active session for class ${workoutClassId}`);
       return;
     }
+
+    console.log(
+      `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
+    );
+    await session.corporateSetupPromise.catch((err) => {
+      console.warn(
+        `[RecordingWorker] Corporate setup ended with error for class ${workoutClassId}:`,
+        err,
+      );
+    });
 
     this.activeSessions.delete(workoutClassId);
 
@@ -258,6 +406,7 @@ export class RecordingSessionManager {
       return;
     }
     this.activeSessions.delete(workoutClassId);
+    await session.corporateSetupPromise.catch(() => undefined);
     await this.closeEntries(session.entries);
     await session.browser.close().catch(() => undefined);
     console.log(`[RecordingWorker] Force-closed browser for class ${workoutClassId}`);
@@ -283,7 +432,69 @@ export class RecordingSessionManager {
     return resp.json() as Promise<JoinDetails>;
   }
 
-  private buildRecordingUrl(joinDetails: JoinDetails): string {
+  private async fetchStaffPresence(workoutClassId: number): Promise<StaffPresence> {
+    const url = `${this.apiBase}/class-recording/worker/staff-presence/${workoutClassId}`;
+    const resp = await fetch(url, {
+      headers: { 'x-recording-worker-key': this.workerKey },
+    });
+    if (!resp.ok) {
+      throw new Error(
+        `Failed to fetch staff presence: ${resp.status} ${await resp.text()}`,
+      );
+    }
+    return resp.json() as Promise<StaffPresence>;
+  }
+
+  private async waitForStaffPresence(
+    workoutClassId: number,
+    staff: StaffRole,
+    timeoutMs: number,
+  ): Promise<StaffPresence | null> {
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      try {
+        const presence = await this.fetchStaffPresence(workoutClassId);
+        const isPresent =
+          staff === 'trainer' ? presence.trainerInCall : presence.coachInCall;
+        if (isPresent) {
+          console.log(
+            `[RecordingWorker] ${staff} is in call for class ${workoutClassId}`,
+            {
+              leadTrainerUserId: presence.leadTrainerUserId,
+              assignedCoachUserId: presence.assignedCoachUserId,
+              participantCount: presence.participantUserIds?.length ?? 0,
+            },
+          );
+          return presence;
+        }
+
+        console.log(
+          `[RecordingWorker] Waiting for ${staff} to join class ${workoutClassId}...`,
+          {
+            trainerInCall: presence.trainerInCall,
+            coachInCall: presence.coachInCall,
+            leadTrainerUserId: presence.leadTrainerUserId,
+            assignedCoachUserId: presence.assignedCoachUserId,
+            participantsInRoom: presence.participantUserIds,
+          },
+        );
+      } catch (err) {
+        console.warn('[RecordingWorker] Staff presence poll failed:', err);
+      }
+
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) break;
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, Math.min(STAFF_POLL_INTERVAL_MS, remaining)),
+      );
+    }
+
+    return null;
+  }
+
+  private buildClientRecordingUrl(joinDetails: JoinDetails): string {
     const params = new URLSearchParams({
       classId: String(joinDetails.classId),
       recordingMode: 'true',
@@ -294,13 +505,25 @@ export class RecordingSessionManager {
     return `${this.webAppUrl}${this.workoutPath}?${params.toString()}`;
   }
 
-  private async openRecordingContext(
+  private buildCorporateRecordingUrl(
+    classId: number,
+    perspective: 'trainer' | 'coach',
+    liveViewRole: string,
+  ): string {
+    const params = new URLSearchParams({
+      classId: String(classId),
+      recordingMode: 'true',
+      recordingPerspective: perspective,
+      role: liveViewRole,
+    });
+    return `${this.webAppUrl}${this.workoutPath}?${params.toString()}`;
+  }
+
+  private async createRecordingContext(
     browser: Browser,
-    joinDetails: JoinDetails,
     workoutClassId: number,
     perspective: Perspective,
-    authSession: ClientAuthSession,
-  ): Promise<{ context: BrowserContext; page: Page; perspective: Perspective }> {
+  ): Promise<{ context: BrowserContext; page: Page }> {
     const videoDir = path.join(process.cwd(), 'recordings', String(workoutClassId));
     await fs.mkdir(videoDir, { recursive: true });
 
@@ -314,9 +537,7 @@ export class RecordingSessionManager {
       permissions: [],
     });
 
-    await this.seedAuthSession(context, authSession);
-
-    (context as any).__perspective = perspective;
+    (context as { __perspective?: Perspective }).__perspective = perspective;
 
     const page = await context.newPage();
     page.on('dialog', async (dialog) => {
@@ -324,8 +545,25 @@ export class RecordingSessionManager {
       await dialog.dismiss().catch(() => undefined);
     });
 
-    const recordingUrl = this.buildRecordingUrl(joinDetails);
-    console.log(`[RecordingWorker] Navigating ${perspective} bot to ${recordingUrl}`);
+    return { context, page };
+  }
+
+  private async openClientRecordingContext(
+    browser: Browser,
+    joinDetails: JoinDetails,
+    workoutClassId: number,
+    authSession: AuthSession,
+  ): Promise<{ context: BrowserContext; page: Page; perspective: Perspective }> {
+    const { context, page } = await this.createRecordingContext(
+      browser,
+      workoutClassId,
+      'client',
+    );
+
+    await this.seedAuthSession(context, authSession);
+
+    const recordingUrl = this.buildClientRecordingUrl(joinDetails);
+    console.log(`[RecordingWorker] Navigating client bot to ${recordingUrl}`);
 
     await page.goto(recordingUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
 
@@ -335,13 +573,56 @@ export class RecordingSessionManager {
       );
     }
 
-    await this.waitForClientSessionJoined(page, perspective);
-    return { context, page, perspective };
+    await this.waitForSessionJoined(page, 'client', false);
+    return { context, page, perspective: 'client' };
   }
 
-  private async waitForClientSessionJoined(
+  private async openCorporateRecordingContext(
+    browser: Browser,
+    workoutClassId: number,
+    perspective: 'trainer' | 'coach',
+    liveViewRole: string,
+    authSession: AuthSession,
+  ): Promise<{ context: BrowserContext; page: Page; perspective: Perspective }> {
+    const { context, page } = await this.createRecordingContext(
+      browser,
+      workoutClassId,
+      perspective,
+    );
+
+    try {
+      await this.seedAuthSession(context, authSession);
+
+      const recordingUrl = this.buildCorporateRecordingUrl(
+        workoutClassId,
+        perspective,
+        liveViewRole,
+      );
+      console.log(`[RecordingWorker] Navigating ${perspective} corporate bot to ${recordingUrl}`);
+
+      await page.goto(recordingUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+
+      if (
+        page.url().includes('/authentication/instructorLogin') ||
+        page.url().includes('/authentication/clientLogin')
+      ) {
+        throw new Error(
+          'Corporate recording bot was redirected to login. Check CORPORATE_EMAIL/CORPORATE_PASSWORD credentials.',
+        );
+      }
+
+      await this.waitForSessionJoined(page, perspective, true);
+      return { context, page, perspective };
+    } catch (err) {
+      await context.close().catch(() => undefined);
+      throw err;
+    }
+  }
+
+  private async waitForSessionJoined(
     page: Page,
     perspective: Perspective,
+    waitForLiveViewReady: boolean,
   ): Promise<void> {
     const joinButton = page.locator('#joinCallButton');
     try {
@@ -370,11 +651,34 @@ export class RecordingSessionManager {
       });
 
     console.log(`[RecordingWorker] ${perspective} bot joined the live session`);
+
+    if (waitForLiveViewReady) {
+      try {
+        await page.waitForSelector('[data-recording-live-view-ready="true"]', {
+          timeout: 60000,
+        });
+        console.log(`[RecordingWorker] ${perspective} corporate live view is ready`);
+      } catch {
+        console.warn(
+          `[RecordingWorker] ${perspective} live view readiness marker not detected — continuing recording anyway`,
+        );
+      }
+    }
+
     await page.waitForTimeout(3000);
   }
 
   private async collectAudioFromPage(page: Page): Promise<Buffer | null> {
     try {
+      await page.evaluate(async () => {
+        const resume = (window as Window & {
+          __resumeRecordingBotAudio?: () => Promise<void>;
+        }).__resumeRecordingBotAudio;
+        if (typeof resume === 'function') {
+          await resume();
+        }
+      });
+
       const base64Audio = await page.evaluate(async () => {
         const stop = (window as Window & {
           __stopRecordingBotAudio?: () => Promise<string | null>;
@@ -390,7 +694,11 @@ export class RecordingSessionManager {
         return null;
       }
 
-      return Buffer.from(base64Audio, 'base64');
+      const audioBuffer = Buffer.from(base64Audio, 'base64');
+      console.log(
+        `[RecordingWorker] Collected page audio (${audioBuffer.length} bytes)`,
+      );
+      return audioBuffer;
     } catch (err) {
       console.warn('[RecordingWorker] Failed to collect page audio:', err);
       return null;
