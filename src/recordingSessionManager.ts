@@ -15,6 +15,8 @@ interface JoinDetails {
   classId: number;
   perspective: Perspective;
   webAppUrl: string;
+  startsAt?: number;
+  duration?: number;
 }
 
 interface StaffPresence {
@@ -194,7 +196,7 @@ export class RecordingSessionManager {
 
     try {
       browser = await chromium.launch({
-        headless: false,
+        headless: true,
         ignoreDefaultArgs: ['--mute-audio'],
         args: [
           '--use-fake-ui-for-media-stream',
@@ -502,6 +504,12 @@ export class RecordingSessionManager {
       roomToken: joinDetails.roomToken,
       roomUrl: joinDetails.roomUrl,
     });
+    if (joinDetails.startsAt) {
+      params.set('startsAt', String(joinDetails.startsAt));
+    }
+    if (joinDetails.duration) {
+      params.set('duration', String(joinDetails.duration));
+    }
     return `${this.webAppUrl}${this.workoutPath}?${params.toString()}`;
   }
 
