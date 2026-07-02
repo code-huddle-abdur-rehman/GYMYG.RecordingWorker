@@ -53,6 +53,7 @@ const STAFF_POLL_INTERVAL_MS = 5_000;
 
 export class RecordingSessionManager {
   private activeSessions = new Map<number, ActiveSession>();
+  private stoppingClassIds = new Set<number>();
   private s3 = new S3Client({
     region: process.env.AWS_REGION || 'us-east-1',
     followRegionRedirects: true,
@@ -338,6 +339,8 @@ export class RecordingSessionManager {
       return;
     }
 
+    this.stoppingClassIds.add(workoutClassId);
+
     console.log(
       `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
     );
@@ -349,11 +352,15 @@ export class RecordingSessionManager {
     });
 
     this.activeSessions.delete(workoutClassId);
+    this.stoppingClassIds.delete(workoutClassId);
 
     try {
       for (const entry of session.entries) {
         try {
-          const audioBuffer = await this.collectAudioFromPage(entry.page);
+          const audioBuffer = await this.collectAudioFromPage(
+            entry.page,
+            entry.perspective,
+          );
           const video = entry.page.video();
           const screenshot = await entry.page
             .screenshot({ type: 'png' })
@@ -407,8 +414,10 @@ export class RecordingSessionManager {
     if (!session) {
       return;
     }
+    this.stoppingClassIds.add(workoutClassId);
     this.activeSessions.delete(workoutClassId);
     await session.corporateSetupPromise.catch(() => undefined);
+    this.stoppingClassIds.delete(workoutClassId);
     await this.closeEntries(session.entries);
     await session.browser.close().catch(() => undefined);
     console.log(`[RecordingWorker] Force-closed browser for class ${workoutClassId}`);
@@ -455,6 +464,13 @@ export class RecordingSessionManager {
     const deadline = Date.now() + timeoutMs;
 
     while (Date.now() < deadline) {
+      if (this.stoppingClassIds.has(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Stop requested — aborting ${staff} presence wait for class ${workoutClassId}`,
+        );
+        return null;
+      }
+
       try {
         const presence = await this.fetchStaffPresence(workoutClassId);
         const isPresent =
@@ -673,10 +689,24 @@ export class RecordingSessionManager {
       }
     }
 
+    try {
+      await page.waitForSelector('[data-recording-audio-capture-ready="true"]', {
+        timeout: 60000,
+      });
+      console.log(`[RecordingWorker] ${perspective} page audio capture is ready`);
+    } catch {
+      console.warn(
+        `[RecordingWorker] ${perspective} audio capture readiness marker not detected — continuing recording anyway`,
+      );
+    }
+
     await page.waitForTimeout(3000);
   }
 
-  private async collectAudioFromPage(page: Page): Promise<Buffer | null> {
+  private async collectAudioFromPage(
+    page: Page,
+    perspective: Perspective,
+  ): Promise<Buffer | null> {
     try {
       await page.evaluate(async () => {
         const resume = (window as Window & {
@@ -687,28 +717,41 @@ export class RecordingSessionManager {
         }
       });
 
-      const base64Audio = await page.evaluate(async () => {
+      const audioResult = await page.evaluate(async () => {
         const stop = (window as Window & {
           __stopRecordingBotAudio?: () => Promise<string | null>;
         }).__stopRecordingBotAudio;
         if (typeof stop !== 'function') {
-          return null;
+          return { reason: 'hook-missing' as const, data: null };
         }
-        return stop();
+        const data = await stop();
+        if (!data) {
+          return { reason: 'empty-blob' as const, data: null };
+        }
+        return { reason: 'ok' as const, data };
       });
 
-      if (!base64Audio) {
-        console.warn('[RecordingWorker] No page audio captured for recording bot');
+      if (audioResult.reason === 'hook-missing') {
+        console.warn(
+          `[RecordingWorker] No page audio hook for ${perspective} bot (never reached STATE_JOINED or capture not started)`,
+        );
         return null;
       }
 
-      const audioBuffer = Buffer.from(base64Audio, 'base64');
+      if (audioResult.reason === 'empty-blob') {
+        console.warn(
+          `[RecordingWorker] Page audio blob empty for ${perspective} bot (no audio sources captured)`,
+        );
+        return null;
+      }
+
+      const audioBuffer = Buffer.from(audioResult.data, 'base64');
       console.log(
-        `[RecordingWorker] Collected page audio (${audioBuffer.length} bytes)`,
+        `[RecordingWorker] Collected ${perspective} page audio (${audioBuffer.length} bytes)`,
       );
       return audioBuffer;
     } catch (err) {
-      console.warn('[RecordingWorker] Failed to collect page audio:', err);
+      console.warn(`[RecordingWorker] Failed to collect ${perspective} page audio:`, err);
       return null;
     }
   }
