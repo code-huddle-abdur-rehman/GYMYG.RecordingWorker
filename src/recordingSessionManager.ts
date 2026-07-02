@@ -1,5 +1,6 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { promises as fs } from 'fs';
+import os from 'os';
 import path from 'path';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { v4 as uuidv4 } from 'uuid';
@@ -368,15 +369,21 @@ export class RecordingSessionManager {
           await entry.context.close();
           const videoPath = video ? await video.path() : null;
           if (videoPath) {
+            const tempDir = path.dirname(videoPath);
             const uploadPath = await this.prepareUploadVideo(videoPath, audioBuffer);
-            await this.uploadRecording(
-              workoutClassId,
-              entry.perspective,
-              uploadPath,
-              screenshot,
-            );
-            if (uploadPath !== videoPath) {
-              await removeFileIfExists(uploadPath);
+            try {
+              await this.uploadRecording(
+                workoutClassId,
+                entry.perspective,
+                uploadPath,
+                screenshot,
+              );
+            } finally {
+              await removeFileIfExists(videoPath);
+              if (uploadPath !== videoPath) {
+                await removeFileIfExists(uploadPath);
+              }
+              await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
             }
           } else {
             await this.notifyFailed(workoutClassId, entry.perspective);
@@ -548,7 +555,12 @@ export class RecordingSessionManager {
     workoutClassId: number,
     perspective: Perspective,
   ): Promise<{ context: BrowserContext; page: Page }> {
-    const videoDir = path.join(process.cwd(), 'recordings', String(workoutClassId));
+    const videoDir = path.join(
+      os.tmpdir(),
+      'gymyg-recording-worker',
+      String(workoutClassId),
+      perspective,
+    );
     await fs.mkdir(videoDir, { recursive: true });
 
     const context = await browser.newContext({
