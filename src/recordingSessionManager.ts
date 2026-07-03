@@ -235,12 +235,13 @@ export class RecordingSessionManager {
           '--disable-dev-shm-usage',
           '--no-sandbox',
           '--disable-setuid-sandbox',
-          // GPU — disabled because we run headless on a server without a display
+          // GPU — disabled because we run headless on a server without a display.
+          // NOTE: do NOT add --disable-software-rasterizer here; without a GPU,
+          //       Chromium falls back to the software rasterizer, and disabling it
+          //       causes an immediate renderer crash.
           '--disable-gpu',
-          '--disable-software-rasterizer',
-          // Reduce per-process overhead: audio stays in the browser process
-          '--disable-features=AudioServiceOutOfProcess',
-          // Silence background services that would otherwise spin up extra threads
+          // Silence background services that spin up extra threads / processes
+          // but are entirely unused by a headless recording bot.
           '--disable-background-networking',
           '--disable-default-apps',
           '--disable-extensions',
@@ -249,7 +250,6 @@ export class RecordingSessionManager {
           '--metrics-recording-only',
           '--safebrowsing-disable-auto-update',
           '--disable-domain-reliability',
-          '--disable-hang-monitor',
           '--disable-client-side-phishing-detection',
           '--disable-prompt-on-repost',
         ],
