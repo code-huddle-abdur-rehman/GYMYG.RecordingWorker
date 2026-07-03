@@ -58,6 +58,13 @@ const STAFF_WAIT_TIMEOUT_MS = 300_000;
 const STAFF_POLL_INTERVAL_MS = 5_000;
 const SESSION_JOIN_TIMEOUT_MS = 300_000;
 
+function getRecordingResolution(): { width: number; height: number } {
+  const raw = process.env.RECORDING_RESOLUTION ?? '1280x720';
+  const [w, h] = raw.split('x').map(Number);
+  if (w > 0 && h > 0) return { width: w, height: h };
+  return { width: 1280, height: 720 };
+}
+
 export class RecordingSessionManager {
   readonly joinAs: Perspective;
 
@@ -224,9 +231,27 @@ export class RecordingSessionManager {
           '--use-fake-ui-for-media-stream',
           '--use-fake-device-for-media-stream',
           '--autoplay-policy=no-user-gesture-required',
+          // Shared-memory / sandbox
           '--disable-dev-shm-usage',
-          '--disable-gpu',
           '--no-sandbox',
+          '--disable-setuid-sandbox',
+          // GPU — disabled because we run headless on a server without a display
+          '--disable-gpu',
+          '--disable-software-rasterizer',
+          // Reduce per-process overhead: audio stays in the browser process
+          '--disable-features=AudioServiceOutOfProcess',
+          // Silence background services that would otherwise spin up extra threads
+          '--disable-background-networking',
+          '--disable-default-apps',
+          '--disable-extensions',
+          '--disable-sync',
+          '--disable-translate',
+          '--metrics-recording-only',
+          '--safebrowsing-disable-auto-update',
+          '--disable-domain-reliability',
+          '--disable-hang-monitor',
+          '--disable-client-side-phishing-detection',
+          '--disable-prompt-on-repost',
         ],
       });
 
@@ -648,12 +673,14 @@ export class RecordingSessionManager {
     );
     await fs.mkdir(videoDir, { recursive: true });
 
+    const resolution = getRecordingResolution();
+
     const context = await browser.newContext({
       recordVideo: {
         dir: videoDir,
-        size: { width: 1280, height: 720 },
+        size: resolution,
       },
-      viewport: { width: 1280, height: 720 },
+      viewport: resolution,
       ignoreHTTPSErrors: true,
       permissions: [],
     });
@@ -664,6 +691,11 @@ export class RecordingSessionManager {
     page.on('dialog', async (dialog) => {
       console.log(`[RecordingWorker] Dismissing browser dialog: ${dialog.message()}`);
       await dialog.dismiss().catch(() => undefined);
+    });
+    page.on('crash', () => {
+      console.error(
+        `[RecordingWorker] *** Page CRASHED *** for ${perspective} perspective, class ${workoutClassId}`,
+      );
     });
 
     return { context, page, videoRecordingStartMs };
@@ -775,8 +807,16 @@ export class RecordingSessionManager {
         },
         { timeout: SESSION_JOIN_TIMEOUT_MS },
       )
-      .catch(async () => {
-        // Capture diagnostic state to help pinpoint why the page never joined.
+      .catch(async (err: unknown) => {
+        const msg = err instanceof Error ? err.message : String(err);
+        // Playwright throws a specific message when the renderer crashes.
+        if (msg.toLowerCase().includes('crash') || msg.toLowerCase().includes('target closed')) {
+          throw new Error(
+            `Recording bot page crashed while joining the ${perspective} session — check server memory`,
+          );
+        }
+
+        // Genuine timeout: capture diagnostic state to help future debugging.
         const diagnostics = await page
           .evaluate(() => ({
             url: window.location.href,
@@ -818,13 +858,26 @@ export class RecordingSessionManager {
         timeout: 60000,
       });
       console.log(`[RecordingWorker] ${perspective} page audio capture is ready`);
-    } catch {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.toLowerCase().includes('crash') || msg.toLowerCase().includes('target closed')) {
+        throw new Error(
+          `Recording bot page crashed after joining the ${perspective} session — check server memory`,
+        );
+      }
       console.warn(
         `[RecordingWorker] ${perspective} audio capture readiness marker not detected — continuing recording anyway`,
       );
     }
 
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(3000).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.toLowerCase().includes('crash') || msg.toLowerCase().includes('target closed')) {
+        throw new Error(
+          `Recording bot page crashed after joining the ${perspective} session — check server memory`,
+        );
+      }
+    });
   }
 
   private async collectAudioFromPage(
