@@ -12,42 +12,61 @@ function getFfmpegPath(): string {
   return ffmpegPath || 'ffmpeg';
 }
 
+export interface MuxSyncOptions {
+  /** Skip this many seconds from the video start (video begins before audio). */
+  videoTrimSeconds?: number;
+  /** Delay audio by this many seconds to compensate for screencast capture lag. */
+  audioDelaySeconds?: number;
+}
+
+function buildMuxArgs(
+  videoPath: string,
+  audioPath: string,
+  outputPath: string,
+  sync?: MuxSyncOptions,
+  reencodeAudio = false,
+): string[] {
+  const args = ['-y'];
+  const videoTrim = Math.max(0, sync?.videoTrimSeconds ?? 0);
+  const audioDelay = Math.max(0, sync?.audioDelaySeconds ?? 0);
+
+  if (videoTrim > 0) {
+    args.push('-ss', videoTrim.toFixed(3));
+  }
+  args.push('-i', videoPath);
+
+  if (audioDelay > 0) {
+    args.push('-itsoffset', audioDelay.toFixed(3));
+  }
+  args.push('-i', audioPath);
+
+  args.push('-c:v', 'copy');
+  if (reencodeAudio) {
+    args.push('-c:a', 'libopus', '-b:a', '128k');
+  } else {
+    args.push('-c:a', 'copy');
+  }
+  args.push('-shortest', outputPath);
+  return args;
+}
+
 export async function muxVideoWithAudio(
   videoPath: string,
   audioPath: string,
   outputPath: string,
+  sync?: MuxSyncOptions,
 ): Promise<void> {
   const ffmpeg = getFfmpegPath();
   try {
-    await execFileAsync(ffmpeg, [
-      '-y',
-      '-i',
-      videoPath,
-      '-i',
-      audioPath,
-      '-c:v',
-      'copy',
-      '-c:a',
-      'copy',
-      '-shortest',
-      outputPath,
-    ]);
+    await execFileAsync(
+      ffmpeg,
+      buildMuxArgs(videoPath, audioPath, outputPath, sync, false),
+    );
   } catch {
-    await execFileAsync(ffmpeg, [
-      '-y',
-      '-i',
-      videoPath,
-      '-i',
-      audioPath,
-      '-c:v',
-      'copy',
-      '-c:a',
-      'libopus',
-      '-b:a',
-      '128k',
-      '-shortest',
-      outputPath,
-    ]);
+    await execFileAsync(
+      ffmpeg,
+      buildMuxArgs(videoPath, audioPath, outputPath, sync, true),
+    );
   }
 }
 

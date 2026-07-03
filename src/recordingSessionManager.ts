@@ -30,7 +30,12 @@ interface StaffPresence {
 }
 
 interface ActiveSession {
-  entries: Array<{ context: BrowserContext; page: Page; perspective: Perspective }>;
+  entries: Array<{
+    context: BrowserContext;
+    page: Page;
+    perspective: Perspective;
+    videoRecordingStartMs: number;
+  }>;
   browser: Browser;
   corporateSetupPromise: Promise<void>;
 }
@@ -53,6 +58,8 @@ const STAFF_WAIT_TIMEOUT_MS = 300_000;
 const STAFF_POLL_INTERVAL_MS = 5_000;
 
 export class RecordingSessionManager {
+  readonly joinAs: Perspective;
+
   private activeSessions = new Map<number, ActiveSession>();
   private stoppingClassIds = new Set<number>();
   private s3 = new S3Client({
@@ -65,6 +72,18 @@ export class RecordingSessionManager {
         }
       : undefined,
   });
+
+  constructor() {
+    this.joinAs = this.parseJoinAs();
+  }
+
+  private parseJoinAs(): Perspective {
+    const value = process.env.JOIN_AS?.trim().toLowerCase();
+    if (!value || !['client', 'trainer', 'coach'].includes(value)) {
+      throw new Error('JOIN_AS must be set to one of: client, trainer, coach');
+    }
+    return value as Perspective;
+  }
 
   private get apiBase() {
     return (process.env.API_BASE_URL || 'http://localhost:3002/api').replace(/\/$/, '');
@@ -210,21 +229,23 @@ export class RecordingSessionManager {
         ],
       });
 
-      const clientAuthSession = await this.loginRecordingBot();
-      console.log('[RecordingWorker] Recording bot authenticated as client');
+      if (this.joinAs === 'client') {
+        const clientAuthSession = await this.loginRecordingBot();
+        console.log('[RecordingWorker] Recording bot authenticated as client');
 
-      const clientJoinDetails = await this.fetchJoinDetails(workoutClassId, 'client');
-      const clientEntry = await this.openClientRecordingContext(
-        browser,
-        clientJoinDetails,
-        workoutClassId,
-        clientAuthSession,
-      );
-      entries.push(clientEntry);
-      console.log(`[RecordingWorker] Client browser session open for class ${workoutClassId}`);
+        const clientJoinDetails = await this.fetchJoinDetails(workoutClassId, 'client');
+        const clientEntry = await this.openClientRecordingContext(
+          browser,
+          clientJoinDetails,
+          workoutClassId,
+          clientAuthSession,
+        );
+        entries.push(clientEntry);
+        console.log(`[RecordingWorker] Client browser session open for class ${workoutClassId}`);
+      }
 
       if (!browser) {
-        throw new Error('Browser was unexpectedly closed after opening client context');
+        throw new Error('Browser was unexpectedly closed after opening recording context');
       }
 
       const session: ActiveSession = {
@@ -232,15 +253,20 @@ export class RecordingSessionManager {
         entries,
         corporateSetupPromise: Promise.resolve(),
       };
-      session.corporateSetupPromise = this.startCorporateRecordingBots(
-        workoutClassId,
-        session,
-      );
+
+      if (this.joinAs === 'trainer' || this.joinAs === 'coach') {
+        session.corporateSetupPromise = this.startCorporateRecordingBots(
+          workoutClassId,
+          session,
+          this.joinAs,
+        );
+      }
+
       this.activeSessions.set(workoutClassId, session);
       browser = null;
 
       console.log(
-        `[RecordingWorker] Client session registered for class ${workoutClassId}; corporate trainer/coach bots starting in background`,
+        `[RecordingWorker] ${this.joinAs} session registered for class ${workoutClassId}`,
       );
     } catch (err) {
       await this.closeEntries(entries);
@@ -255,6 +281,7 @@ export class RecordingSessionManager {
   private async startCorporateRecordingBots(
     workoutClassId: number,
     session: ActiveSession,
+    joinAs: 'trainer' | 'coach',
   ): Promise<void> {
     let corporateAuthSession: AuthSession | null = null;
 
@@ -327,9 +354,14 @@ export class RecordingSessionManager {
       }
     })();
 
-    await Promise.all([trainerTask, coachTask]);
+    if (joinAs === 'trainer') {
+      await trainerTask;
+    } else {
+      await coachTask;
+    }
+
     console.log(
-      `[RecordingWorker] Corporate setup finished for class ${workoutClassId}: ${session.entries.length} active context(s)`,
+      `[RecordingWorker] Corporate ${joinAs} setup finished for class ${workoutClassId}: ${session.entries.length} active context(s)`,
     );
   }
 
@@ -358,7 +390,7 @@ export class RecordingSessionManager {
     try {
       for (const entry of session.entries) {
         try {
-          const audioBuffer = await this.collectAudioFromPage(
+          const { buffer: audioBuffer, audioStartMs } = await this.collectAudioFromPage(
             entry.page,
             entry.perspective,
           );
@@ -370,7 +402,12 @@ export class RecordingSessionManager {
           const videoPath = video ? await video.path() : null;
           if (videoPath) {
             const tempDir = path.dirname(videoPath);
-            const uploadPath = await this.prepareUploadVideo(videoPath, audioBuffer);
+            const uploadPath = await this.prepareUploadVideo(
+              videoPath,
+              audioBuffer,
+              entry.videoRecordingStartMs,
+              audioStartMs,
+            );
             try {
               await this.uploadRecording(
                 workoutClassId,
@@ -550,11 +587,20 @@ export class RecordingSessionManager {
     return `${this.webAppUrl}${this.workoutPath}?${params.toString()}`;
   }
 
+  private getScreencastAudioDelaySeconds(): number {
+    const ms = Number(process.env.RECORDING_AUDIO_DELAY_MS ?? 300);
+    if (!Number.isFinite(ms) || ms <= 0) {
+      return 0;
+    }
+    return ms / 1000;
+  }
+
   private async createRecordingContext(
     browser: Browser,
     workoutClassId: number,
     perspective: Perspective,
-  ): Promise<{ context: BrowserContext; page: Page }> {
+  ): Promise<{ context: BrowserContext; page: Page; videoRecordingStartMs: number }> {
+    const videoRecordingStartMs = Date.now();
     const videoDir = path.join(
       os.tmpdir(),
       'gymyg-recording-worker',
@@ -581,7 +627,7 @@ export class RecordingSessionManager {
       await dialog.dismiss().catch(() => undefined);
     });
 
-    return { context, page };
+    return { context, page, videoRecordingStartMs };
   }
 
   private async openClientRecordingContext(
@@ -589,8 +635,13 @@ export class RecordingSessionManager {
     joinDetails: JoinDetails,
     workoutClassId: number,
     authSession: AuthSession,
-  ): Promise<{ context: BrowserContext; page: Page; perspective: Perspective }> {
-    const { context, page } = await this.createRecordingContext(
+  ): Promise<{
+    context: BrowserContext;
+    page: Page;
+    perspective: Perspective;
+    videoRecordingStartMs: number;
+  }> {
+    const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
       browser,
       workoutClassId,
       'client',
@@ -610,7 +661,7 @@ export class RecordingSessionManager {
     }
 
     await this.waitForSessionJoined(page, 'client', false);
-    return { context, page, perspective: 'client' };
+    return { context, page, perspective: 'client', videoRecordingStartMs };
   }
 
   private async openCorporateRecordingContext(
@@ -619,8 +670,13 @@ export class RecordingSessionManager {
     perspective: 'trainer' | 'coach',
     liveViewRole: string,
     authSession: AuthSession,
-  ): Promise<{ context: BrowserContext; page: Page; perspective: Perspective }> {
-    const { context, page } = await this.createRecordingContext(
+  ): Promise<{
+    context: BrowserContext;
+    page: Page;
+    perspective: Perspective;
+    videoRecordingStartMs: number;
+  }> {
+    const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
       browser,
       workoutClassId,
       perspective,
@@ -648,7 +704,7 @@ export class RecordingSessionManager {
       }
 
       await this.waitForSessionJoined(page, perspective, true);
-      return { context, page, perspective };
+      return { context, page, perspective, videoRecordingStartMs };
     } catch (err) {
       await context.close().catch(() => undefined);
       throw err;
@@ -718,7 +774,7 @@ export class RecordingSessionManager {
   private async collectAudioFromPage(
     page: Page,
     perspective: Perspective,
-  ): Promise<Buffer | null> {
+  ): Promise<{ buffer: Buffer | null; audioStartMs: number | null }> {
     try {
       await page.evaluate(async () => {
         const resume = (window as Window & {
@@ -730,47 +786,54 @@ export class RecordingSessionManager {
       });
 
       const audioResult = await page.evaluate(async () => {
-        const stop = (window as Window & {
+        const win = window as Window & {
           __stopRecordingBotAudio?: () => Promise<string | null>;
-        }).__stopRecordingBotAudio;
-        if (typeof stop !== 'function') {
-          return { reason: 'hook-missing' as const, data: null };
+          __recordingAudioStartMs?: number;
+        };
+        const audioStartMs =
+          typeof win.__recordingAudioStartMs === 'number'
+            ? win.__recordingAudioStartMs
+            : null;
+        if (typeof win.__stopRecordingBotAudio !== 'function') {
+          return { reason: 'hook-missing' as const, data: null, audioStartMs };
         }
-        const data = await stop();
+        const data = await win.__stopRecordingBotAudio();
         if (!data) {
-          return { reason: 'empty-blob' as const, data: null };
+          return { reason: 'empty-blob' as const, data: null, audioStartMs };
         }
-        return { reason: 'ok' as const, data };
+        return { reason: 'ok' as const, data, audioStartMs };
       });
 
       if (audioResult.reason === 'hook-missing') {
         console.warn(
           `[RecordingWorker] No page audio hook for ${perspective} bot (never reached STATE_JOINED or capture not started)`,
         );
-        return null;
+        return { buffer: null, audioStartMs: audioResult.audioStartMs };
       }
 
       if (audioResult.reason === 'empty-blob') {
         console.warn(
           `[RecordingWorker] Page audio blob empty for ${perspective} bot (no audio sources captured)`,
         );
-        return null;
+        return { buffer: null, audioStartMs: audioResult.audioStartMs };
       }
 
       const audioBuffer = Buffer.from(audioResult.data, 'base64');
       console.log(
         `[RecordingWorker] Collected ${perspective} page audio (${audioBuffer.length} bytes)`,
       );
-      return audioBuffer;
+      return { buffer: audioBuffer, audioStartMs: audioResult.audioStartMs };
     } catch (err) {
       console.warn(`[RecordingWorker] Failed to collect ${perspective} page audio:`, err);
-      return null;
+      return { buffer: null, audioStartMs: null };
     }
   }
 
   private async prepareUploadVideo(
     videoPath: string,
     audioBuffer: Buffer | null,
+    videoRecordingStartMs: number,
+    audioStartMs: number | null,
   ): Promise<string> {
     if (!audioBuffer || audioBuffer.length === 0) {
       console.warn('[RecordingWorker] Uploading video without audio track');
@@ -781,8 +844,27 @@ export class RecordingSessionManager {
     const audioPath = await writeTempFile(tempDir, `audio-${uuidv4()}.webm`, audioBuffer);
     const outputPath = path.join(tempDir, `muxed-${uuidv4()}.webm`);
 
+    const videoTrimSeconds =
+      audioStartMs != null
+        ? Math.max(0, (audioStartMs - videoRecordingStartMs) / 1000)
+        : 0;
+    const audioDelaySeconds = this.getScreencastAudioDelaySeconds();
+
+    if (videoTrimSeconds > 0 || audioDelaySeconds > 0) {
+      console.log(
+        `[RecordingWorker] A/V sync: trim video ${videoTrimSeconds.toFixed(2)}s, delay audio ${audioDelaySeconds.toFixed(2)}s`,
+      );
+    } else if (audioStartMs == null) {
+      console.warn(
+        '[RecordingWorker] Audio start timestamp missing — muxing without video trim',
+      );
+    }
+
     try {
-      await muxVideoWithAudio(videoPath, audioPath, outputPath);
+      await muxVideoWithAudio(videoPath, audioPath, outputPath, {
+        videoTrimSeconds,
+        audioDelaySeconds,
+      });
       console.log('[RecordingWorker] Muxed page audio into recording video');
       return outputPath;
     } catch (err) {
@@ -893,7 +975,7 @@ export class RecordingSessionManager {
   }
 
   async notifySessionMissing(workoutClassId: number): Promise<void> {
-    const url = `${this.apiBase}/class-recording/worker/session-missing/${workoutClassId}`;
+    const url = `${this.apiBase}/class-recording/worker/session-missing/${workoutClassId}/${this.joinAs}`;
     await fetch(url, {
       method: 'POST',
       headers: { 'x-recording-worker-key': this.workerKey },
