@@ -56,6 +56,7 @@ interface LoginResponse {
 
 const STAFF_WAIT_TIMEOUT_MS = 300_000;
 const STAFF_POLL_INTERVAL_MS = 5_000;
+const SESSION_JOIN_TIMEOUT_MS = 300_000;
 
 export class RecordingSessionManager {
   readonly joinAs: Perspective;
@@ -734,11 +735,11 @@ export class RecordingSessionManager {
           const workoutApp = document.querySelector('.app.relative.call-background');
           return !joinBtn && !!workoutApp;
         },
-        { timeout: 120000 },
+        { timeout: SESSION_JOIN_TIMEOUT_MS },
       )
       .catch(() => {
         throw new Error(
-          `Recording bot failed to join the ${perspective} session within 120s`,
+          `Recording bot failed to join the ${perspective} session within ${SESSION_JOIN_TIMEOUT_MS / 1000}s`,
         );
       });
 
