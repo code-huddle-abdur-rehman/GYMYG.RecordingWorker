@@ -307,62 +307,97 @@ export class RecordingSessionManager {
       );
     };
 
-    const runTrainerTask = async () => {
-      try {
-        const presence = await this.waitForStaffPresence(
-          workoutClassId,
-          'trainer',
-          STAFF_WAIT_TIMEOUT_MS,
-        );
-        if (!presence) {
-          console.warn(
-            `[RecordingWorker] Trainer not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — skipping trainer recording`,
-          );
-          await this.notifyFailed(workoutClassId, 'trainer');
-          return;
-        }
-        await openPerspective('trainer', 'trainer');
-      } catch (err) {
-        console.error(
-          `[RecordingWorker] Failed to start trainer corporate bot for class ${workoutClassId}:`,
-          err,
-        );
-        await this.notifyFailed(workoutClassId, 'trainer');
-      }
-    };
+    // ── Initial join attempt ──────────────────────────────────────────────
+    let wasInCall = false;
 
-    const runCoachTask = async () => {
-      try {
-        const presence = await this.waitForStaffPresence(
-          workoutClassId,
-          'coach',
-          STAFF_WAIT_TIMEOUT_MS,
-        );
-        if (!presence?.coachLiveViewRole) {
-          console.warn(
-            `[RecordingWorker] Coach not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — skipping coach recording`,
-          );
-          await this.notifyFailed(workoutClassId, 'coach');
-          return;
-        }
-        await openPerspective('coach', presence.coachLiveViewRole);
-      } catch (err) {
-        console.error(
-          `[RecordingWorker] Failed to start coach corporate bot for class ${workoutClassId}:`,
-          err,
-        );
-        await this.notifyFailed(workoutClassId, 'coach');
-      }
-    };
+    const initialPresence = await this.waitForStaffPresence(
+      workoutClassId,
+      joinAs,
+      STAFF_WAIT_TIMEOUT_MS,
+    );
 
-    if (joinAs === 'trainer') {
-      await runTrainerTask();
+    if (!initialPresence) {
+      console.warn(
+        `[RecordingWorker] ${joinAs} not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — will watch for re-join`,
+      );
+      await this.notifyFailed(workoutClassId, joinAs);
     } else {
-      await runCoachTask();
+      wasInCall = true;
+      const liveViewRole =
+        joinAs === 'trainer' ? 'trainer' : initialPresence.coachLiveViewRole;
+      if (!liveViewRole) {
+        console.warn(
+          `[RecordingWorker] No live view role for ${joinAs} class ${workoutClassId}`,
+        );
+        await this.notifyFailed(workoutClassId, joinAs);
+      } else {
+        try {
+          await openPerspective(joinAs, liveViewRole);
+        } catch (err) {
+          console.error(
+            `[RecordingWorker] Failed to start ${joinAs} corporate bot for class ${workoutClassId}:`,
+            err,
+          );
+          await this.notifyFailed(workoutClassId, joinAs);
+        }
+      }
     }
 
     console.log(
-      `[RecordingWorker] Corporate ${joinAs} setup finished for class ${workoutClassId}: ${session.entries.length} active context(s)`,
+      `[RecordingWorker] Corporate ${joinAs} initial setup done for class ${workoutClassId}: ${session.entries.length} active context(s). Watching for re-joins...`,
+    );
+
+    // ── Re-join watcher ───────────────────────────────────────────────────
+    // Keeps running until stopClassRecording signals via stoppingClassIds.
+    // When the staff member leaves and rejoins, a fresh recording context is
+    // opened and appended to session.entries so it gets uploaded on stop.
+    while (!this.stoppingClassIds.has(workoutClassId)) {
+      await new Promise<void>((resolve) =>
+        setTimeout(resolve, STAFF_POLL_INTERVAL_MS),
+      );
+      if (this.stoppingClassIds.has(workoutClassId)) break;
+
+      try {
+        const presence = await this.fetchStaffPresence(workoutClassId);
+        const isInCall =
+          joinAs === 'trainer' ? presence.trainerInCall : presence.coachInCall;
+
+        if (isInCall && !wasInCall) {
+          const liveViewRole =
+            joinAs === 'trainer' ? 'trainer' : presence.coachLiveViewRole;
+          if (!liveViewRole) {
+            console.warn(
+              `[RecordingWorker] ${joinAs} rejoined class ${workoutClassId} but no live view role`,
+            );
+          } else {
+            console.log(
+              `[RecordingWorker] ${joinAs} rejoined class ${workoutClassId} — opening fresh recording context`,
+            );
+            try {
+              await openPerspective(joinAs, liveViewRole);
+              console.log(
+                `[RecordingWorker] ${joinAs} re-join recording started for class ${workoutClassId}`,
+              );
+            } catch (err) {
+              console.error(
+                `[RecordingWorker] Failed to open re-join context for ${joinAs} class ${workoutClassId}:`,
+                err,
+              );
+            }
+          }
+        }
+
+        wasInCall = isInCall;
+      } catch (err) {
+        console.warn(
+          `[RecordingWorker] Re-join poll error for ${joinAs} class ${workoutClassId}:`,
+          err,
+        );
+      }
+    }
+
+    console.log(
+      `[RecordingWorker] Corporate ${joinAs} watcher done for class ${workoutClassId}`,
     );
   }
 
@@ -389,7 +424,10 @@ export class RecordingSessionManager {
     this.stoppingClassIds.delete(workoutClassId);
 
     try {
-      for (const entry of session.entries) {
+      // Snapshot entries before iterating — the re-join watcher may still push
+      // new contexts to session.entries while we are stopping.
+      const entries = [...session.entries];
+      for (const entry of entries) {
         try {
           const { buffer: audioBuffer, audioStartMs } = await this.collectAudioFromPage(
             entry.page,
@@ -737,7 +775,24 @@ export class RecordingSessionManager {
         },
         { timeout: SESSION_JOIN_TIMEOUT_MS },
       )
-      .catch(() => {
+      .catch(async () => {
+        // Capture diagnostic state to help pinpoint why the page never joined.
+        const diagnostics = await page
+          .evaluate(() => ({
+            url: window.location.href,
+            callState: (window as unknown as Record<string, unknown>).__callState ?? null,
+            hasJoinBtn: !!document.querySelector('#joinCallButton'),
+            hasCallBg: !!document.querySelector('.app.relative.call-background'),
+            hasAudioReady: !!document.querySelector('[data-recording-audio-capture-ready="true"]'),
+            bodyDataset: Object.fromEntries(
+              Object.entries((document.body as HTMLElement & { dataset: DOMStringMap }).dataset),
+            ),
+          }))
+          .catch(() => null);
+        console.error(
+          `[RecordingWorker] ${perspective} join timed out after ${SESSION_JOIN_TIMEOUT_MS / 1000}s — page diagnostics:`,
+          diagnostics,
+        );
         throw new Error(
           `Recording bot failed to join the ${perspective} session within ${SESSION_JOIN_TIMEOUT_MS / 1000}s`,
         );
