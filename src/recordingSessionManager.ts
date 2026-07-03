@@ -306,7 +306,7 @@ export class RecordingSessionManager {
       );
     };
 
-    const trainerTask = (async () => {
+    const runTrainerTask = async () => {
       try {
         const presence = await this.waitForStaffPresence(
           workoutClassId,
@@ -328,9 +328,9 @@ export class RecordingSessionManager {
         );
         await this.notifyFailed(workoutClassId, 'trainer');
       }
-    })();
+    };
 
-    const coachTask = (async () => {
+    const runCoachTask = async () => {
       try {
         const presence = await this.waitForStaffPresence(
           workoutClassId,
@@ -352,12 +352,12 @@ export class RecordingSessionManager {
         );
         await this.notifyFailed(workoutClassId, 'coach');
       }
-    })();
+    };
 
     if (joinAs === 'trainer') {
-      await trainerTask;
+      await runTrainerTask();
     } else {
-      await coachTask;
+      await runCoachTask();
     }
 
     console.log(
