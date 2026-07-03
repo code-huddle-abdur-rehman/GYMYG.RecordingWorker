@@ -2,9 +2,10 @@ import 'dotenv/config';
 import { Queue, Worker } from 'bullmq';
 import { parseRedisUrl } from './redis.js';
 import { RecordingSessionManager } from './recordingSessionManager.js';
-
-const QUEUE_CLASS_RECORDING_START = 'class-recording-start';
-const QUEUE_CLASS_RECORDING_STOP = 'class-recording-stop';
+import {
+  classRecordingStartQueue,
+  classRecordingStopQueue,
+} from './queues.js';
 
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {
@@ -13,8 +14,17 @@ if (!redisUrl) {
 
 const connection = parseRedisUrl(redisUrl);
 const sessionManager = new RecordingSessionManager();
+const joinAs = sessionManager.joinAs;
+const startQueueName = classRecordingStartQueue(joinAs);
+const stopQueueName = classRecordingStopQueue(joinAs);
+
+console.log(`[RecordingWorker] JOIN_AS=${joinAs}`);
+console.log(`[RecordingWorker] Start queue: ${startQueueName}`);
+console.log(`[RecordingWorker] Stop queue: ${stopQueueName}`);
+
 const startJobsInFlight = new Map<number, Promise<void>>();
-const startQueue = new Queue(QUEUE_CLASS_RECORDING_START, { connection });
+const startQueue = new Queue(startQueueName, { connection });
+const stopQueue = new Queue(stopQueueName, { connection });
 
 let shuttingDown = false;
 
@@ -23,7 +33,7 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   console.log(`[RecordingWorker] ${signal} received — closing browsers...`);
   await sessionManager.closeAllSessions();
-  await startQueue.close();
+  await Promise.all([startQueue.close(), stopQueue.close()]);
   process.exit(0);
 }
 
@@ -73,18 +83,22 @@ async function waitForActiveSession(
 console.log('[RecordingWorker] Starting workers...');
 
 new Worker(
-  QUEUE_CLASS_RECORDING_START,
+  startQueueName,
   async (job) => {
     const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
-    console.log(`[RecordingWorker] Start recording for class ${workoutClassId}`);
+    console.log(
+      `[RecordingWorker] Start ${joinAs} recording for class ${workoutClassId}`,
+    );
     const startPromise = sessionManager.startClassRecording(workoutClassId);
     startJobsInFlight.set(workoutClassId, startPromise);
     try {
       await startPromise;
-      console.log(`[RecordingWorker] Recording session ready for class ${workoutClassId}`);
+      console.log(
+        `[RecordingWorker] ${joinAs} recording session ready for class ${workoutClassId}`,
+      );
     } catch (err) {
       console.error(
-        `[RecordingWorker] Failed to start recording for class ${workoutClassId}:`,
+        `[RecordingWorker] Failed to start ${joinAs} recording for class ${workoutClassId}:`,
         err instanceof Error ? err.message : err,
       );
       await sessionManager.forceCloseSession(workoutClassId);
@@ -97,15 +111,17 @@ new Worker(
 );
 
 new Worker(
-  QUEUE_CLASS_RECORDING_STOP,
+  stopQueueName,
   async (job) => {
     const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
-    console.log(`[RecordingWorker] Stop recording for class ${workoutClassId}`);
+    console.log(
+      `[RecordingWorker] Stop ${joinAs} recording for class ${workoutClassId}`,
+    );
 
     const hasSession = await waitForActiveSession(workoutClassId);
     if (!hasSession) {
       console.warn(
-        `[RecordingWorker] No active session for class ${workoutClassId} — was the worker running for the full class?`,
+        `[RecordingWorker] No active ${joinAs} session for class ${workoutClassId} — was the worker running for the full class?`,
       );
       await sessionManager.notifySessionMissing(workoutClassId);
       return;
@@ -116,4 +132,6 @@ new Worker(
   { connection, concurrency: 1 },
 );
 
-console.log('[RecordingWorker] Listening for recording jobs (client + corporate trainer/coach bots)');
+console.log(
+  `[RecordingWorker] Listening on ${startQueueName} and ${stopQueueName}`,
+);
