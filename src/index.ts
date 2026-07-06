@@ -1,8 +1,8 @@
 import 'dotenv/config';
-import { readFileSync } from 'fs';
 import { Queue, Worker } from 'bullmq';
 import { parseRedisUrl } from './redis.js';
 import { RecordingSessionManager } from './recordingSessionManager.js';
+import { collectSystemResources, logFileDescriptorLimits } from './diagnostics.js';
 import {
   classRecordingStartQueue,
   classRecordingStopQueue,
@@ -16,31 +16,20 @@ import {
 // the renderer within seconds of joining the call.
 //
 // The correct long-term fix is to add `LimitNOFILE=65536` to the systemd
-// service unit (or run the process with `ulimit -n 65536`).  This block logs
+// service unit (or run the process with `ulimit -n 65536`).  These logs record
 // the current limits at startup so you can confirm they are high enough before
 // recording starts.
-(function checkFileDescriptorLimits() {
-  try {
-    const limits = readFileSync('/proc/self/limits', 'utf-8');
-    const match = limits.match(/Max open files\s+(\S+)\s+(\S+)/);
-    if (!match) return;
-    const soft = match[1] === 'unlimited' ? Infinity : parseInt(match[1], 10);
-    const hard = match[2] === 'unlimited' ? Infinity : parseInt(match[2], 10);
-    console.log(
-      `[RecordingWorker] File descriptor limits — soft: ${soft === Infinity ? 'unlimited' : soft}, hard: ${hard === Infinity ? 'unlimited' : hard}`,
-    );
-    if (soft < 4096) {
-      console.warn(
-        `[RecordingWorker] ⚠  LOW FILE DESCRIPTOR LIMIT (soft=${soft}).` +
-          ' WebRTC recording is likely to crash with ERR_INSUFFICIENT_RESOURCES.' +
-          ' Fix: add LimitNOFILE=65536 to the systemd service unit and run' +
-          ' `systemctl daemon-reload && systemctl restart <service>`.',
-      );
-    }
-  } catch {
-    // Not Linux, or /proc unavailable — skip silently.
-  }
-})();
+await logFileDescriptorLimits('startup');
+void collectSystemResources().then((res) =>
+  console.log('[RecordingWorker][diag] startup system resources', {
+    platform: res.platform,
+    loadAvg: res.loadAvg,
+    totalMemMb: res.totalMemMb,
+    freeMemMb: res.freeMemMb,
+    nodeFdCount: res.nodeFdCount,
+    nodeFdLimit: res.nodeFdLimit,
+  }),
+);
 
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {

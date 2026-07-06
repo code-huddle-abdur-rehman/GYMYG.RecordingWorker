@@ -5,6 +5,11 @@ import path from 'path';
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import { v4 as uuidv4 } from 'uuid';
 
+import {
+  collectSystemResources,
+  logFileDescriptorLimits,
+  PageDiagnostics,
+} from './diagnostics.js';
 import { muxVideoWithAudio, removeFileIfExists, writeTempFile } from './media.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
@@ -29,13 +34,16 @@ interface StaffPresence {
   participantUserIds?: string[];
 }
 
+interface RecordingEntry {
+  context: BrowserContext;
+  page: Page;
+  perspective: Perspective;
+  videoRecordingStartMs: number;
+  diagnostics: PageDiagnostics;
+}
+
 interface ActiveSession {
-  entries: Array<{
-    context: BrowserContext;
-    page: Page;
-    perspective: Perspective;
-    videoRecordingStartMs: number;
-  }>;
+  entries: RecordingEntry[];
   browser: Browser;
   corporateSetupPromise: Promise<void>;
 }
@@ -309,6 +317,19 @@ export class RecordingSessionManager {
         args: getChromiumLaunchArgs(),
       });
 
+      console.log(
+        `[RecordingWorker] Launched Chromium for class ${workoutClassId} (${this.joinAs})`,
+      );
+      await logFileDescriptorLimits(`browser launch, class ${workoutClassId}`);
+
+      // Surface browser-level disconnects (whole process gone) — distinct from
+      // a single renderer page crash.
+      browser.on('disconnected', () => {
+        console.error(
+          `[RecordingWorker] Chromium browser process disconnected for class ${workoutClassId} (${this.joinAs})`,
+        );
+      });
+
       if (this.joinAs === 'client') {
         const clientAuthSession = await this.loginRecordingBot();
         console.log('[RecordingWorker] Recording bot authenticated as client');
@@ -516,6 +537,7 @@ export class RecordingSessionManager {
           const screenshot = await entry.page
             .screenshot({ type: 'png' })
             .catch(() => undefined);
+          await entry.diagnostics.dispose().catch(() => undefined);
           await entry.context.close();
           const videoPath = video ? await video.path() : null;
           if (videoPath) {
@@ -545,6 +567,7 @@ export class RecordingSessionManager {
           }
         } catch (err) {
           console.error('[RecordingWorker] Error closing context:', err);
+          await entry.diagnostics.dispose().catch(() => undefined);
           await entry.context.close().catch(() => undefined);
           await this.notifyFailed(workoutClassId, entry.perspective);
         }
@@ -587,7 +610,10 @@ export class RecordingSessionManager {
 
   private async closeEntries(entries: ActiveSession['entries']): Promise<void> {
     await Promise.all(
-      entries.map((entry) => entry.context.close().catch(() => undefined)),
+      entries.map(async (entry) => {
+        await entry.diagnostics.dispose().catch(() => undefined);
+        await entry.context.close().catch(() => undefined);
+      }),
     );
   }
 
@@ -765,7 +791,12 @@ export class RecordingSessionManager {
     browser: Browser,
     workoutClassId: number,
     perspective: Perspective,
-  ): Promise<{ context: BrowserContext; page: Page; videoRecordingStartMs: number }> {
+  ): Promise<{
+    context: BrowserContext;
+    page: Page;
+    videoRecordingStartMs: number;
+    diagnostics: PageDiagnostics;
+  }> {
     const videoRecordingStartMs = Date.now();
     const videoDir = path.join(
       os.tmpdir(),
@@ -846,7 +877,16 @@ export class RecordingSessionManager {
     });
     this.attachPageLogging(page, perspective, workoutClassId);
 
-    return { context, page, videoRecordingStartMs };
+    // Rolling diagnostics buffer + crash reporter for this page. Any renderer
+    // crash now emits a full report (fd usage, failed requests, renderer
+    // metrics, recent console output) instead of a bare "Page CRASHED" line.
+    const diagnostics = new PageDiagnostics(page, perspective, workoutClassId);
+    diagnostics.attach();
+    page.on('crash', () => {
+      void diagnostics.logCrashReport('page "crash" event fired');
+    });
+
+    return { context, page, videoRecordingStartMs, diagnostics };
   }
 
   private async openClientRecordingContext(
@@ -854,20 +894,14 @@ export class RecordingSessionManager {
     joinDetails: JoinDetails,
     workoutClassId: number,
     authSession: AuthSession,
-  ): Promise<{
-    context: BrowserContext;
-    page: Page;
-    perspective: Perspective;
-    videoRecordingStartMs: number;
-  }> {
+  ): Promise<RecordingEntry> {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
-        browser,
-        workoutClassId,
-        'client',
-      );
+      const { context, page, videoRecordingStartMs, diagnostics } =
+        await this.createRecordingContext(browser, workoutClassId, 'client');
+      // Sample resource usage throughout the join — this is when crashes occur.
+      diagnostics.startSampling();
 
       try {
         await this.seedAuthSession(context, authSession);
@@ -883,9 +917,14 @@ export class RecordingSessionManager {
           );
         }
 
-        await this.waitForSessionJoined(page, 'client', false);
-        return { context, page, perspective: 'client', videoRecordingStartMs };
+        await this.waitForSessionJoined(page, 'client', false, diagnostics);
+        diagnostics.stopSampling();
+        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics };
       } catch (err) {
+        await diagnostics.logCrashReport(
+          `client join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        await diagnostics.dispose();
         await context.close().catch(() => undefined);
         lastError = err;
         if (attempt < RECORDING_JOIN_ATTEMPTS && this.isRecoverableRecordingError(err)) {
@@ -909,20 +948,13 @@ export class RecordingSessionManager {
     perspective: 'trainer' | 'coach',
     liveViewRole: string,
     authSession: AuthSession,
-  ): Promise<{
-    context: BrowserContext;
-    page: Page;
-    perspective: Perspective;
-    videoRecordingStartMs: number;
-  }> {
+  ): Promise<RecordingEntry> {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
-        browser,
-        workoutClassId,
-        perspective,
-      );
+      const { context, page, videoRecordingStartMs, diagnostics } =
+        await this.createRecordingContext(browser, workoutClassId, perspective);
+      diagnostics.startSampling();
 
       try {
         await this.seedAuthSession(context, authSession);
@@ -947,9 +979,14 @@ export class RecordingSessionManager {
           );
         }
 
-        await this.waitForSessionJoined(page, perspective, true);
-        return { context, page, perspective, videoRecordingStartMs };
+        await this.waitForSessionJoined(page, perspective, true, diagnostics);
+        diagnostics.stopSampling();
+        return { context, page, perspective, videoRecordingStartMs, diagnostics };
       } catch (err) {
+        await diagnostics.logCrashReport(
+          `${perspective} corporate join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+        await diagnostics.dispose();
         await context.close().catch(() => undefined);
         lastError = err;
         if (attempt < RECORDING_JOIN_ATTEMPTS && this.isRecoverableRecordingError(err)) {
@@ -971,6 +1008,7 @@ export class RecordingSessionManager {
     page: Page,
     perspective: Perspective,
     waitForLiveViewReady: boolean,
+    pageDiagnostics?: PageDiagnostics,
   ): Promise<void> {
     // Build a promise that rejects the instant the renderer crashes.
     // This lets us short-circuit timed locator waits (which Playwright does NOT
@@ -1050,6 +1088,9 @@ export class RecordingSessionManager {
           console.error(
             `[RecordingWorker] ${perspective} join timed out after ${SESSION_JOIN_TIMEOUT_MS / 1000}s — page diagnostics:`,
             diagnostics,
+          );
+          await pageDiagnostics?.logCrashReport(
+            `${perspective} join timed out after ${SESSION_JOIN_TIMEOUT_MS / 1000}s`,
           );
           throw new Error(
             `Recording bot failed to join the ${perspective} session within ${SESSION_JOIN_TIMEOUT_MS / 1000}s`,
