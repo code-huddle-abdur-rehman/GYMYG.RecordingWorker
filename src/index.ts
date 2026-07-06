@@ -1,7 +1,11 @@
 import 'dotenv/config';
 import { Queue, Worker } from 'bullmq';
 import { parseRedisUrl } from './redis.js';
-import { RecordingSessionManager } from './recordingSessionManager.js';
+import {
+  cleanupRecordingTmpDir,
+  getRecordingTmpDir,
+  RecordingSessionManager,
+} from './recordingSessionManager.js';
 import { collectSystemResources, logFileDescriptorLimits } from './diagnostics.js';
 import {
   classRecordingStartQueue,
@@ -20,6 +24,8 @@ import {
 // the current limits at startup so you can confirm they are high enough before
 // recording starts.
 await logFileDescriptorLimits('startup');
+console.log(`[RecordingWorker] Recording temp dir: ${getRecordingTmpDir()}`);
+await cleanupRecordingTmpDir();
 void collectSystemResources().then((res) =>
   console.log('[RecordingWorker][diag] startup system resources', {
     platform: res.platform,
@@ -28,6 +34,7 @@ void collectSystemResources().then((res) =>
     freeMemMb: res.freeMemMb,
     nodeFdCount: res.nodeFdCount,
     nodeFdLimit: res.nodeFdLimit,
+    diskUsage: res.diskUsage,
   }),
 );
 

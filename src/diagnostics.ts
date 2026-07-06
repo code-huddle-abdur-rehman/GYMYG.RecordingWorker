@@ -30,6 +30,12 @@ interface ProcessFdInfo {
   limit: RlimitInfo | null;
 }
 
+interface DiskUsage {
+  totalMb: number;
+  freeMb: number;
+  usedPct: number;
+}
+
 interface SystemResourceSnapshot {
   platform: string;
   loadAvg: number[];
@@ -40,6 +46,7 @@ interface SystemResourceSnapshot {
   nodeFdLimit: RlimitInfo | null;
   chromiumProcesses: ProcessFdInfo[];
   chromiumFdTotal: number | null;
+  diskUsage: Record<string, DiskUsage>;
 }
 
 interface PageMetricSnapshot {
@@ -157,15 +164,60 @@ async function collectChromiumProcessFds(): Promise<{
   }
 }
 
+async function readDiskUsage(dirPath: string): Promise<DiskUsage | null> {
+  try {
+    const stats = await fs.statfs(dirPath);
+    const blockSize = stats.bsize;
+    const totalMb = Math.round((stats.blocks * blockSize) / 1024 / 1024);
+    const freeMb = Math.round((stats.bavail * blockSize) / 1024 / 1024);
+    if (totalMb === 0) return null;
+    const usedPct = Math.round(((totalMb - freeMb) / totalMb) * 100);
+    return { totalMb, freeMb, usedPct };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Reports free space on the volumes that matter for a crash: the RAM-backed
+ * tmpfs mounts (/tmp, /dev/shm) that Chromium uses for shared memory, and the
+ * disk where recordings are written. A full tmpfs is what produces the
+ * "Disk quota exceeded (122)" font-service FATAL that crashes the renderer.
+ */
+async function collectDiskUsage(): Promise<Record<string, DiskUsage>> {
+  const candidates = Array.from(
+    new Set(
+      [
+        os.tmpdir(),
+        '/tmp',
+        '/dev/shm',
+        '/var/tmp',
+        process.env.RECORDING_TMP_DIR,
+      ].filter((p): p is string => Boolean(p)),
+    ),
+  );
+  const result: Record<string, DiskUsage> = {};
+  await Promise.all(
+    candidates.map(async (dirPath) => {
+      const usage = await readDiskUsage(dirPath);
+      if (usage) result[dirPath] = usage;
+    }),
+  );
+  return result;
+}
+
 export async function collectSystemResources(): Promise<SystemResourceSnapshot> {
-  const [nodeFdCount, nodeFdLimit, processRssMb, chromium] = await Promise.all([
-    countProcessFds('self'),
-    readProcessRlimit('self'),
-    readProcessRssMb('self'),
-    collectChromiumProcessFds(),
-  ]);
+  const [nodeFdCount, nodeFdLimit, processRssMb, chromium, diskUsage] =
+    await Promise.all([
+      countProcessFds('self'),
+      readProcessRlimit('self'),
+      readProcessRssMb('self'),
+      collectChromiumProcessFds(),
+      collectDiskUsage(),
+    ]);
 
   return {
+    diskUsage,
     platform: process.platform,
     loadAvg: os.loadavg().map((n) => Number(n.toFixed(2))),
     totalMemMb: Math.round(os.totalmem() / 1024 / 1024),
@@ -402,6 +454,7 @@ export class PageDiagnostics {
           nodeFdLimit: system.nodeFdLimit,
           chromiumFdTotal: system.chromiumFdTotal,
           chromiumProcessCount: system.chromiumProcesses.length,
+          diskUsage: system.diskUsage,
         },
       });
     } catch {
@@ -462,7 +515,22 @@ export class PageDiagnostics {
         nodeFdCount: system.nodeFdCount,
         nodeFdLimit: system.nodeFdLimit,
         chromiumFdTotal: system.chromiumFdTotal,
+        diskUsage: system.diskUsage,
       });
+
+      // A nearly-full tmpfs (/tmp or /dev/shm) is what makes Chromium's
+      // shared-memory/font writes fail with "Disk quota exceeded (122)" and
+      // crash the renderer, so call it out explicitly.
+      for (const [mount, usage] of Object.entries(system.diskUsage)) {
+        if (usage.usedPct >= 90 || usage.freeMb <= 50) {
+          console.error(
+            `${this.tag}: VERDICT — low temp/disk space on ${mount}: ` +
+              `${usage.freeMb}MB free of ${usage.totalMb}MB (${usage.usedPct}% used). ` +
+              'This causes Chromium "Disk quota exceeded (122)" renderer crashes. ' +
+              'Move large temp files off this volume or grow it.',
+          );
+        }
+      }
       if (system.chromiumProcesses.length) {
         console.error(
           `${this.tag}: chromium process fd usage (top consumers):`,

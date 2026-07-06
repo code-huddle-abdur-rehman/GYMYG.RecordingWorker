@@ -75,6 +75,43 @@ function getRecordingResolution(): { width: number; height: number } {
   return { width: 960, height: 540 };
 }
 
+/**
+ * Base directory for recording video + mux temp files.
+ *
+ * On the recording servers `/tmp` is a small, RAM-backed tmpfs (455 MB–953 MB)
+ * that is *shared* with Chromium's shared-memory/font data (because we launch
+ * with --disable-dev-shm-usage). Writing multi-hundred-MB recording videos
+ * there fills the tmpfs and makes Chromium's next shared-memory write fail with
+ * "Disk quota exceeded (122)", crashing the renderer. So we deliberately write
+ * recordings to the real root disk (which has plenty of free space) instead of
+ * tmpfs. Override with RECORDING_TMP_DIR if a different volume is preferred.
+ */
+export function getRecordingTmpDir(): string {
+  if (process.env.RECORDING_TMP_DIR) return process.env.RECORDING_TMP_DIR;
+  // /var/tmp lives on the root filesystem (not tmpfs) on the Ubuntu recording
+  // hosts, so large files here never pressure RAM or Chromium's temp space.
+  if (process.platform === 'linux') return '/var/tmp/gymyg-recording-worker';
+  return path.join(os.tmpdir(), 'gymyg-recording-worker');
+}
+
+/**
+ * Removes leftover recording temp files. Safe to call at process startup: this
+ * host runs a single recording worker, so at boot there are no in-progress
+ * recordings and any files present are orphans from a previous crash/restart.
+ */
+export async function cleanupRecordingTmpDir(): Promise<void> {
+  const dir = getRecordingTmpDir();
+  try {
+    await fs.rm(dir, { recursive: true, force: true });
+    console.log(`[RecordingWorker] Cleared stale recording temp dir ${dir}`);
+  } catch (err) {
+    console.warn(
+      `[RecordingWorker] Could not clear recording temp dir ${dir}:`,
+      err,
+    );
+  }
+}
+
 function getChromiumLaunchArgs(): string[] {
   return [
     '--use-fake-ui-for-media-stream',
@@ -82,7 +119,14 @@ function getChromiumLaunchArgs(): string[] {
     '--autoplay-policy=no-user-gesture-required',
     // Shared-memory / sandbox.  --no-zygote prevents the zygote broker process
     // that can wedge or crash in some Linux/container environments.
-    '--disable-dev-shm-usage',
+    //
+    // NOTE: we intentionally do NOT pass --disable-dev-shm-usage. That flag
+    // redirects Chromium's shared memory to /tmp, which on these hosts is a
+    // small RAM-backed tmpfs already occupied by recording files — filling it
+    // makes Chromium's shm/font writes fail with "Disk quota exceeded (122)"
+    // and crash the renderer. /dev/shm is sized to ~half of RAM (455 MB–953 MB
+    // here) and sits empty, so letting Chromium use it is both correct and
+    // avoids the tmpfs contention entirely.
     '--no-sandbox',
     '--disable-setuid-sandbox',
     '--no-zygote',
@@ -313,7 +357,10 @@ export class RecordingSessionManager {
     try {
       browser = await chromium.launch({
         headless: true,
-        ignoreDefaultArgs: ['--mute-audio'],
+        // Playwright injects --disable-dev-shm-usage by default; strip it so
+        // Chromium uses the (empty, adequately-sized) /dev/shm instead of the
+        // congested /tmp tmpfs. See getChromiumLaunchArgs for the rationale.
+        ignoreDefaultArgs: ['--mute-audio', '--disable-dev-shm-usage'],
         args: getChromiumLaunchArgs(),
       });
 
@@ -580,6 +627,14 @@ export class RecordingSessionManager {
         );
       });
       console.log(`[RecordingWorker] Browser closed for class ${workoutClassId}`);
+      // Remove the now-empty per-class temp directory (its per-perspective
+      // subdirs were already deleted after upload) so nothing lingers on disk.
+      await fs
+        .rm(path.join(getRecordingTmpDir(), String(workoutClassId)), {
+          recursive: true,
+          force: true,
+        })
+        .catch(() => undefined);
     }
   }
 
@@ -796,11 +851,11 @@ export class RecordingSessionManager {
     page: Page;
     videoRecordingStartMs: number;
     diagnostics: PageDiagnostics;
+    videoDir: string;
   }> {
     const videoRecordingStartMs = Date.now();
     const videoDir = path.join(
-      os.tmpdir(),
-      'gymyg-recording-worker',
+      getRecordingTmpDir(),
       String(workoutClassId),
       perspective,
     );
@@ -886,7 +941,7 @@ export class RecordingSessionManager {
       void diagnostics.logCrashReport('page "crash" event fired');
     });
 
-    return { context, page, videoRecordingStartMs, diagnostics };
+    return { context, page, videoRecordingStartMs, diagnostics, videoDir };
   }
 
   private async openClientRecordingContext(
@@ -898,7 +953,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir } =
         await this.createRecordingContext(browser, workoutClassId, 'client');
       // Sample resource usage throughout the join — this is when crashes occur.
       diagnostics.startSampling();
@@ -926,6 +981,8 @@ export class RecordingSessionManager {
         );
         await diagnostics.dispose();
         await context.close().catch(() => undefined);
+        // Discard the partial recording so it doesn't accumulate on disk.
+        await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
         lastError = err;
         if (attempt < RECORDING_JOIN_ATTEMPTS && this.isRecoverableRecordingError(err)) {
           console.warn(
@@ -952,7 +1009,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir } =
         await this.createRecordingContext(browser, workoutClassId, perspective);
       diagnostics.startSampling();
 
@@ -988,6 +1045,8 @@ export class RecordingSessionManager {
         );
         await diagnostics.dispose();
         await context.close().catch(() => undefined);
+        // Discard the partial recording so it doesn't accumulate on disk.
+        await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
         lastError = err;
         if (attempt < RECORDING_JOIN_ATTEMPTS && this.isRecoverableRecordingError(err)) {
           console.warn(
