@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { readFileSync } from 'fs';
 import { Queue, Worker } from 'bullmq';
 import { parseRedisUrl } from './redis.js';
 import { RecordingSessionManager } from './recordingSessionManager.js';
@@ -6,6 +7,40 @@ import {
   classRecordingStartQueue,
   classRecordingStopQueue,
 } from './queues.js';
+
+// ── File-descriptor limit check ───────────────────────────────────────────────
+// WebRTC (via Daily.co) opens a UDP socket for every ICE candidate pair
+// (interface × STUN server × media track).  On a busy call that can be 50–200
+// sockets per Chromium renderer.  If the process nofile soft-limit is the
+// Linux default of 1024, Chromium will hit ERR_INSUFFICIENT_RESOURCES and crash
+// the renderer within seconds of joining the call.
+//
+// The correct long-term fix is to add `LimitNOFILE=65536` to the systemd
+// service unit (or run the process with `ulimit -n 65536`).  This block logs
+// the current limits at startup so you can confirm they are high enough before
+// recording starts.
+(function checkFileDescriptorLimits() {
+  try {
+    const limits = readFileSync('/proc/self/limits', 'utf-8');
+    const match = limits.match(/Max open files\s+(\S+)\s+(\S+)/);
+    if (!match) return;
+    const soft = match[1] === 'unlimited' ? Infinity : parseInt(match[1], 10);
+    const hard = match[2] === 'unlimited' ? Infinity : parseInt(match[2], 10);
+    console.log(
+      `[RecordingWorker] File descriptor limits — soft: ${soft === Infinity ? 'unlimited' : soft}, hard: ${hard === Infinity ? 'unlimited' : hard}`,
+    );
+    if (soft < 4096) {
+      console.warn(
+        `[RecordingWorker] ⚠  LOW FILE DESCRIPTOR LIMIT (soft=${soft}).` +
+          ' WebRTC recording is likely to crash with ERR_INSUFFICIENT_RESOURCES.' +
+          ' Fix: add LimitNOFILE=65536 to the systemd service unit and run' +
+          ' `systemctl daemon-reload && systemctl restart <service>`.',
+      );
+    }
+  } catch {
+    // Not Linux, or /proc unavailable — skip silently.
+  }
+})();
 
 const redisUrl = process.env.REDIS_URL;
 if (!redisUrl) {

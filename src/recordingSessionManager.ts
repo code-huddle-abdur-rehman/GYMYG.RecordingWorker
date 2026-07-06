@@ -92,6 +92,14 @@ function getChromiumLaunchArgs(): string[] {
     '--force-color-profile=srgb',
     // Don't waste resources writing minidumps that won't be collected.
     '--disable-crash-reporter',
+    // Restrict WebRTC ICE candidate gathering to the default public network
+    // interface only.  Without this, Chromium opens a UDP socket for *every*
+    // (interface × STUN server × media track) combination, which quickly
+    // exhausts the process's file-descriptor limit and causes
+    // ERR_INSUFFICIENT_RESOURCES / renderer crashes on EC2 instances that use
+    // the default nofile limit of 1024.  Daily.co remains reachable via STUN
+    // through the primary eth0 interface.
+    '--webrtc-ip-handling-policy=default_public_interface_only',
     // Silence background services that spin up extra threads / processes
     // but are entirely unused by a headless recording bot.
     '--disable-background-networking',
@@ -719,9 +727,14 @@ export class RecordingSessionManager {
       // These messages are expected on a headless server and carry no
       // actionable information for the recording worker.
       if (
-        text.includes('setSinkId') ||           // no real audio-output sinks on server
+        text.includes('setSinkId') ||            // no real audio-output sinks on server
         text.includes('GeolocationPositionError') || // no GPS on server
-        text.includes('LogRocket')              // 3rd-party session replay noise
+        text.includes('Geolocation disabled in recording bot') || // our own mock
+        text.includes('LogRocket') ||            // 3rd-party session replay noise
+        text.includes('setBandwidth()') ||       // Daily.co SDK deprecation warning
+        text.includes('Failed to play audio') || // audio elements are intentionally suppressed
+        text.includes('Audio element error') ||  // same — suppressed audio element
+        text.includes('Invalid featureActive value') // Daily.co internal SDK noise
       ) {
         return;
       }
@@ -775,14 +788,32 @@ export class RecordingSessionManager {
     });
 
     // Patch browser APIs that don't work in a headless environment and whose
-    // failures trigger noisy retry loops inside the workout app.
+    // failures trigger noisy retry loops or excessive resource usage.
     await context.addInitScript(() => {
-      // setSinkId selects a named audio-output device.  Headless Chrome has no
-      // real output sinks, so every call throws AbortError and the app retries
-      // every 2 s indefinitely.  Override with a silent no-op.
       if (typeof HTMLMediaElement !== 'undefined') {
+        // setSinkId selects a named audio-output device.  Headless Chrome has
+        // no real output sinks, so every call throws AbortError and the app
+        // retries every 2 s indefinitely.  Override with a silent no-op.
         HTMLMediaElement.prototype.setSinkId = function () {
           return Promise.resolve();
+        };
+
+        // Suppress audio-element playback.  Each active HTMLAudioElement holds
+        // an audio-decoder pipeline and at least one UDP/TCP socket.  On a
+        // live call with multiple participants the app creates one audio
+        // element per participant; activating them all rapidly exhausts the
+        // process's file-descriptor budget and causes ERR_INSUFFICIENT_RESOURCES.
+        // The recording bot captures audio through __stopRecordingBotAudio()
+        // (a WebAudio MediaRecorder path), so HTMLAudioElement playback is
+        // not needed and is safe to suppress.
+        const _origPlay = HTMLMediaElement.prototype.play;
+        HTMLMediaElement.prototype.play = function () {
+          if (this instanceof HTMLAudioElement) {
+            return Promise.resolve();
+          }
+          // Video elements must still play for the screen-capture recording to
+          // render participant video feeds through the compositor.
+          return _origPlay.call(this);
         };
       }
 
