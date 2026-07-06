@@ -57,12 +57,83 @@ interface LoginResponse {
 const STAFF_WAIT_TIMEOUT_MS = 300_000;
 const STAFF_POLL_INTERVAL_MS = 5_000;
 const SESSION_JOIN_TIMEOUT_MS = 300_000;
+const RECORDING_JOIN_ATTEMPTS = 2;
+const RECORDING_JOIN_RETRY_DELAY_MS = 5_000;
 
 function getRecordingResolution(): { width: number; height: number } {
-  const raw = process.env.RECORDING_RESOLUTION ?? '1280x720';
+  const raw = process.env.RECORDING_RESOLUTION ?? '960x540';
   const [w, h] = raw.split('x').map(Number);
   if (w > 0 && h > 0) return { width: w, height: h };
-  return { width: 1280, height: 720 };
+  return { width: 960, height: 540 };
+}
+
+function getChromiumLaunchArgs(): string[] {
+  return [
+    '--use-fake-ui-for-media-stream',
+    '--use-fake-device-for-media-stream',
+    '--autoplay-policy=no-user-gesture-required',
+    // Shared-memory / sandbox.  --no-zygote prevents the zygote broker process
+    // that can wedge or crash in some Linux/container environments.
+    '--disable-dev-shm-usage',
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--no-zygote',
+    // GPU — disabled because we run headless on a server without a display.
+    // NOTE: do NOT add --disable-software-rasterizer here; without a GPU,
+    //       Chromium falls back to the software rasterizer, and disabling it
+    //       causes an immediate renderer crash.
+    '--disable-gpu',
+    '--disable-accelerated-2d-canvas',
+    '--disable-webgl',
+    '--disable-webgl2',
+    // Compositor / surface features that crash on GPU-less Linux hosts.
+    '--disable-features=VizDisplayCompositor,UseSurfaceLayerForVideo,AudioServiceOutOfProcess',
+    // Consistent colour pipeline — avoids ICC-profile lookup crashes.
+    '--force-color-profile=srgb',
+    // Don't waste resources writing minidumps that won't be collected.
+    '--disable-crash-reporter',
+    // Silence background services that spin up extra threads / processes
+    // but are entirely unused by a headless recording bot.
+    '--disable-background-networking',
+    '--disable-default-apps',
+    '--disable-extensions',
+    '--disable-sync',
+    '--disable-translate',
+    '--metrics-recording-only',
+    '--safebrowsing-disable-auto-update',
+    '--disable-domain-reliability',
+    '--disable-client-side-phishing-detection',
+    '--disable-prompt-on-repost',
+    '--no-first-run',
+    '--no-default-browser-check',
+    // Prevent the OS from throttling timers / tasks in the background renderer,
+    // which can confuse WebRTC state machines and trigger hangs.
+    '--disable-background-timer-throttling',
+    '--disable-renderer-backgrounding',
+    '--disable-backgrounding-occluded-windows',
+    '--disable-ipc-flooding-protection',
+  ];
+}
+
+function isPageDeadError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes('crash') ||
+    normalized.includes('target closed') ||
+    normalized.includes('target page, context or browser has been closed') ||
+    normalized.includes('execution context was destroyed') ||
+    normalized.includes('protocol error') ||
+    normalized.includes('page closed')
+  );
+}
+
+function isRecordingJoinPageReady(): boolean {
+  const joinBtn = document.querySelector('#joinCallButton');
+  const workoutApp = document.querySelector('.app.relative.call-background');
+  const audioReady =
+    document.body?.dataset?.recordingAudioCaptureReady === 'true' ||
+    document.querySelector('[data-recording-audio-capture-ready="true"]') !== null;
+  return !joinBtn && (!!workoutApp || audioReady);
 }
 
 export class RecordingSessionManager {
@@ -227,32 +298,7 @@ export class RecordingSessionManager {
       browser = await chromium.launch({
         headless: true,
         ignoreDefaultArgs: ['--mute-audio'],
-        args: [
-          '--use-fake-ui-for-media-stream',
-          '--use-fake-device-for-media-stream',
-          '--autoplay-policy=no-user-gesture-required',
-          // Shared-memory / sandbox
-          '--disable-dev-shm-usage',
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          // GPU — disabled because we run headless on a server without a display.
-          // NOTE: do NOT add --disable-software-rasterizer here; without a GPU,
-          //       Chromium falls back to the software rasterizer, and disabling it
-          //       causes an immediate renderer crash.
-          '--disable-gpu',
-          // Silence background services that spin up extra threads / processes
-          // but are entirely unused by a headless recording bot.
-          '--disable-background-networking',
-          '--disable-default-apps',
-          '--disable-extensions',
-          '--disable-sync',
-          '--disable-translate',
-          '--metrics-recording-only',
-          '--safebrowsing-disable-auto-update',
-          '--disable-domain-reliability',
-          '--disable-client-side-phishing-detection',
-          '--disable-prompt-on-repost',
-        ],
+        args: getChromiumLaunchArgs(),
       });
 
       if (this.joinAs === 'client') {
@@ -659,6 +705,37 @@ export class RecordingSessionManager {
     return ms / 1000;
   }
 
+  private attachPageLogging(
+    page: Page,
+    perspective: Perspective,
+    workoutClassId: number,
+  ): void {
+    page.on('console', (msg) => {
+      const type = msg.type();
+      if (type === 'error' || type === 'warning') {
+        console.log(
+          `[RecordingWorker][${perspective}][console:${type}] class ${workoutClassId}: ${msg.text()}`,
+        );
+      }
+    });
+    page.on('pageerror', (error) => {
+      console.error(
+        `[RecordingWorker][${perspective}][pageerror] class ${workoutClassId}:`,
+        error.message,
+      );
+    });
+    page.on('crash', () => {
+      console.error(
+        `[RecordingWorker] *** Page CRASHED *** for ${perspective} perspective, class ${workoutClassId}`,
+      );
+    });
+  }
+
+  private isRecoverableRecordingError(err: unknown): boolean {
+    const msg = err instanceof Error ? err.message : String(err);
+    return isPageDeadError(msg) || msg.includes('failed to join');
+  }
+
   private async createRecordingContext(
     browser: Browser,
     workoutClassId: number,
@@ -692,11 +769,7 @@ export class RecordingSessionManager {
       console.log(`[RecordingWorker] Dismissing browser dialog: ${dialog.message()}`);
       await dialog.dismiss().catch(() => undefined);
     });
-    page.on('crash', () => {
-      console.error(
-        `[RecordingWorker] *** Page CRASHED *** for ${perspective} perspective, class ${workoutClassId}`,
-      );
-    });
+    this.attachPageLogging(page, perspective, workoutClassId);
 
     return { context, page, videoRecordingStartMs };
   }
@@ -712,27 +785,47 @@ export class RecordingSessionManager {
     perspective: Perspective;
     videoRecordingStartMs: number;
   }> {
-    const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
-      browser,
-      workoutClassId,
-      'client',
-    );
+    let lastError: unknown;
 
-    await this.seedAuthSession(context, authSession);
-
-    const recordingUrl = this.buildClientRecordingUrl(joinDetails);
-    console.log(`[RecordingWorker] Navigating client bot to ${recordingUrl}`);
-
-    await page.goto(recordingUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
-
-    if (page.url().includes('/authentication/clientLogin')) {
-      throw new Error(
-        'Recording bot was redirected to client login. Check EMAIL/PASSWORD credentials.',
+    for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
+      const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
+        browser,
+        workoutClassId,
+        'client',
       );
+
+      try {
+        await this.seedAuthSession(context, authSession);
+
+        const recordingUrl = this.buildClientRecordingUrl(joinDetails);
+        console.log(`[RecordingWorker] Navigating client bot to ${recordingUrl}`);
+
+        await page.goto(recordingUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+
+        if (page.url().includes('/authentication/clientLogin')) {
+          throw new Error(
+            'Recording bot was redirected to client login. Check EMAIL/PASSWORD credentials.',
+          );
+        }
+
+        await this.waitForSessionJoined(page, 'client', false);
+        return { context, page, perspective: 'client', videoRecordingStartMs };
+      } catch (err) {
+        await context.close().catch(() => undefined);
+        lastError = err;
+        if (attempt < RECORDING_JOIN_ATTEMPTS && this.isRecoverableRecordingError(err)) {
+          console.warn(
+            `[RecordingWorker] Client join attempt ${attempt}/${RECORDING_JOIN_ATTEMPTS} failed for class ${workoutClassId}, retrying in ${RECORDING_JOIN_RETRY_DELAY_MS / 1000}s:`,
+            err instanceof Error ? err.message : err,
+          );
+          await new Promise((resolve) => setTimeout(resolve, RECORDING_JOIN_RETRY_DELAY_MS));
+          continue;
+        }
+        throw err;
+      }
     }
 
-    await this.waitForSessionJoined(page, 'client', false);
-    return { context, page, perspective: 'client', videoRecordingStartMs };
+    throw lastError;
   }
 
   private async openCorporateRecordingContext(
@@ -747,39 +840,56 @@ export class RecordingSessionManager {
     perspective: Perspective;
     videoRecordingStartMs: number;
   }> {
-    const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
-      browser,
-      workoutClassId,
-      perspective,
-    );
+    let lastError: unknown;
 
-    try {
-      await this.seedAuthSession(context, authSession);
-
-      const recordingUrl = this.buildCorporateRecordingUrl(
+    for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
+      const { context, page, videoRecordingStartMs } = await this.createRecordingContext(
+        browser,
         workoutClassId,
         perspective,
-        liveViewRole,
       );
-      console.log(`[RecordingWorker] Navigating ${perspective} corporate bot to ${recordingUrl}`);
 
-      await page.goto(recordingUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+      try {
+        await this.seedAuthSession(context, authSession);
 
-      if (
-        page.url().includes('/authentication/instructorLogin') ||
-        page.url().includes('/authentication/clientLogin')
-      ) {
-        throw new Error(
-          'Corporate recording bot was redirected to login. Check CORPORATE_EMAIL/CORPORATE_PASSWORD credentials.',
+        const recordingUrl = this.buildCorporateRecordingUrl(
+          workoutClassId,
+          perspective,
+          liveViewRole,
         );
-      }
+        console.log(
+          `[RecordingWorker] Navigating ${perspective} corporate bot to ${recordingUrl}`,
+        );
 
-      await this.waitForSessionJoined(page, perspective, true);
-      return { context, page, perspective, videoRecordingStartMs };
-    } catch (err) {
-      await context.close().catch(() => undefined);
-      throw err;
+        await page.goto(recordingUrl, { waitUntil: 'domcontentloaded', timeout: 120000 });
+
+        if (
+          page.url().includes('/authentication/instructorLogin') ||
+          page.url().includes('/authentication/clientLogin')
+        ) {
+          throw new Error(
+            'Corporate recording bot was redirected to login. Check CORPORATE_EMAIL/CORPORATE_PASSWORD credentials.',
+          );
+        }
+
+        await this.waitForSessionJoined(page, perspective, true);
+        return { context, page, perspective, videoRecordingStartMs };
+      } catch (err) {
+        await context.close().catch(() => undefined);
+        lastError = err;
+        if (attempt < RECORDING_JOIN_ATTEMPTS && this.isRecoverableRecordingError(err)) {
+          console.warn(
+            `[RecordingWorker] ${perspective} corporate join attempt ${attempt}/${RECORDING_JOIN_ATTEMPTS} failed for class ${workoutClassId}, retrying in ${RECORDING_JOIN_RETRY_DELAY_MS / 1000}s:`,
+            err instanceof Error ? err.message : err,
+          );
+          await new Promise((resolve) => setTimeout(resolve, RECORDING_JOIN_RETRY_DELAY_MS));
+          continue;
+        }
+        throw err;
+      }
     }
+
+    throw lastError;
   }
 
   private async waitForSessionJoined(
@@ -787,56 +897,94 @@ export class RecordingSessionManager {
     perspective: Perspective,
     waitForLiveViewReady: boolean,
   ): Promise<void> {
-    const joinButton = page.locator('#joinCallButton');
+    // Build a promise that rejects the instant the renderer crashes.
+    // This lets us short-circuit timed locator waits (which Playwright does NOT
+    // abort on crash — they silently wait out the full timeout) so we fail fast
+    // and free up the retry budget immediately.
+    let crashHandler: (() => void) | undefined;
+    const crashRejector = new Promise<never>((_, reject) => {
+      crashHandler = () =>
+        reject(
+          new Error(
+            `Recording bot page crashed while joining the ${perspective} session — check server resources`,
+          ),
+        );
+      page.once('crash', crashHandler);
+    });
+    // Suppress Node's unhandled-rejection warning for the cases where the caller
+    // catches the error before (or without) the crash ever firing.
+    crashRejector.catch(() => undefined);
+
+    const removeCrashHandler = () => {
+      if (crashHandler) {
+        page.off('crash', crashHandler);
+        crashHandler = undefined;
+      }
+    };
+
     try {
-      await joinButton.waitFor({ state: 'visible', timeout: 15000 });
-      await joinButton.click();
-      console.log(`[RecordingWorker] Clicked Join Call for ${perspective} bot`);
-    } catch {
-      console.log(
-        `[RecordingWorker] Join Call button not shown for ${perspective} — assuming auto-join`,
-      );
-    }
-
-    await page
-      .waitForFunction(
-        () => {
-          const joinBtn = document.querySelector('#joinCallButton');
-          const workoutApp = document.querySelector('.app.relative.call-background');
-          return !joinBtn && !!workoutApp;
-        },
-        { timeout: SESSION_JOIN_TIMEOUT_MS },
-      )
-      .catch(async (err: unknown) => {
+      const joinButton = page.locator('#joinCallButton');
+      try {
+        // Race the button wait against the crash rejector so we don't spend the
+        // full 15 s timeout polling a renderer that has already died.
+        await Promise.race([
+          joinButton.waitFor({ state: 'visible', timeout: 15000 }),
+          crashRejector,
+        ]);
+        await joinButton.click();
+        console.log(`[RecordingWorker] Clicked Join Call for ${perspective} bot`);
+      } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
-        // Playwright throws a specific message when the renderer crashes.
-        if (msg.toLowerCase().includes('crash') || msg.toLowerCase().includes('target closed')) {
-          throw new Error(
-            `Recording bot page crashed while joining the ${perspective} session — check server memory`,
-          );
-        }
+        if (isPageDeadError(msg)) throw err;
+        console.log(
+          `[RecordingWorker] Join Call button not shown for ${perspective} — assuming auto-join`,
+        );
+      }
 
-        // Genuine timeout: capture diagnostic state to help future debugging.
-        const diagnostics = await page
-          .evaluate(() => ({
-            url: window.location.href,
-            callState: (window as unknown as Record<string, unknown>).__callState ?? null,
-            hasJoinBtn: !!document.querySelector('#joinCallButton'),
-            hasCallBg: !!document.querySelector('.app.relative.call-background'),
-            hasAudioReady: !!document.querySelector('[data-recording-audio-capture-ready="true"]'),
-            bodyDataset: Object.fromEntries(
-              Object.entries((document.body as HTMLElement & { dataset: DOMStringMap }).dataset),
-            ),
-          }))
-          .catch(() => null);
-        console.error(
-          `[RecordingWorker] ${perspective} join timed out after ${SESSION_JOIN_TIMEOUT_MS / 1000}s — page diagnostics:`,
-          diagnostics,
-        );
-        throw new Error(
-          `Recording bot failed to join the ${perspective} session within ${SESSION_JOIN_TIMEOUT_MS / 1000}s`,
-        );
-      });
+      await page
+        .waitForFunction(
+          () => {
+            const joinBtn = document.querySelector('#joinCallButton');
+            const workoutApp = document.querySelector('.app.relative.call-background');
+            return !joinBtn && !!workoutApp;
+          },
+          { timeout: SESSION_JOIN_TIMEOUT_MS },
+        )
+        .catch(async (err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          // Playwright throws a specific message when the renderer crashes.
+          if (isPageDeadError(msg)) {
+            throw new Error(
+              `Recording bot page crashed while joining the ${perspective} session — check server resources`,
+            );
+          }
+
+          // Genuine timeout: capture diagnostic state to help future debugging.
+          const diagnostics = await page
+            .evaluate(() => ({
+              url: window.location.href,
+              callState: (window as unknown as Record<string, unknown>).__callState ?? null,
+              hasJoinBtn: !!document.querySelector('#joinCallButton'),
+              hasCallBg: !!document.querySelector('.app.relative.call-background'),
+              hasAudioReady: !!document.querySelector('[data-recording-audio-capture-ready="true"]'),
+              bodyDataset: Object.fromEntries(
+                Object.entries((document.body as HTMLElement & { dataset: DOMStringMap }).dataset),
+              ),
+            }))
+            .catch(() => null);
+          console.error(
+            `[RecordingWorker] ${perspective} join timed out after ${SESSION_JOIN_TIMEOUT_MS / 1000}s — page diagnostics:`,
+            diagnostics,
+          );
+          throw new Error(
+            `Recording bot failed to join the ${perspective} session within ${SESSION_JOIN_TIMEOUT_MS / 1000}s`,
+          );
+        });
+    } finally {
+      // Remove the crash listener so the pending crashRejector is never settled
+      // after this point — avoids surprise rejections in the caller.
+      removeCrashHandler();
+    }
 
     console.log(`[RecordingWorker] ${perspective} bot joined the live session`);
 
@@ -860,9 +1008,9 @@ export class RecordingSessionManager {
       console.log(`[RecordingWorker] ${perspective} page audio capture is ready`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.toLowerCase().includes('crash') || msg.toLowerCase().includes('target closed')) {
+      if (isPageDeadError(msg)) {
         throw new Error(
-          `Recording bot page crashed after joining the ${perspective} session — check server memory`,
+          `Recording bot page crashed after joining the ${perspective} session — check server resources`,
         );
       }
       console.warn(
@@ -872,9 +1020,9 @@ export class RecordingSessionManager {
 
     await page.waitForTimeout(3000).catch((err: unknown) => {
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.toLowerCase().includes('crash') || msg.toLowerCase().includes('target closed')) {
+      if (isPageDeadError(msg)) {
         throw new Error(
-          `Recording bot page crashed after joining the ${perspective} session — check server memory`,
+          `Recording bot page crashed after joining the ${perspective} session — check server resources`,
         );
       }
     });
