@@ -712,11 +712,23 @@ export class RecordingSessionManager {
   ): void {
     page.on('console', (msg) => {
       const type = msg.type();
-      if (type === 'error' || type === 'warning') {
-        console.log(
-          `[RecordingWorker][${perspective}][console:${type}] class ${workoutClassId}: ${msg.text()}`,
-        );
+      if (type !== 'error' && type !== 'warning') return;
+
+      const text = msg.text();
+
+      // These messages are expected on a headless server and carry no
+      // actionable information for the recording worker.
+      if (
+        text.includes('setSinkId') ||           // no real audio-output sinks on server
+        text.includes('GeolocationPositionError') || // no GPS on server
+        text.includes('LogRocket')              // 3rd-party session replay noise
+      ) {
+        return;
       }
+
+      console.log(
+        `[RecordingWorker][${perspective}][console:${type}] class ${workoutClassId}: ${text}`,
+      );
     });
     page.on('pageerror', (error) => {
       console.error(
@@ -760,6 +772,38 @@ export class RecordingSessionManager {
       viewport: resolution,
       ignoreHTTPSErrors: true,
       permissions: [],
+    });
+
+    // Patch browser APIs that don't work in a headless environment and whose
+    // failures trigger noisy retry loops inside the workout app.
+    await context.addInitScript(() => {
+      // setSinkId selects a named audio-output device.  Headless Chrome has no
+      // real output sinks, so every call throws AbortError and the app retries
+      // every 2 s indefinitely.  Override with a silent no-op.
+      if (typeof HTMLMediaElement !== 'undefined') {
+        HTMLMediaElement.prototype.setSinkId = function () {
+          return Promise.resolve();
+        };
+      }
+
+      // Silence geolocation so the app doesn't log position errors.
+      if (typeof navigator !== 'undefined' && navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition = (
+          _success: PositionCallback,
+          error?: PositionErrorCallback | null,
+        ) => {
+          if (error) {
+            error({
+              code: 1,
+              message: 'Geolocation disabled in recording bot',
+              PERMISSION_DENIED: 1,
+              POSITION_UNAVAILABLE: 2,
+              TIMEOUT: 3,
+            } as GeolocationPositionError);
+          }
+        };
+        navigator.geolocation.watchPosition = () => 0;
+      }
     });
 
     (context as { __perspective?: Perspective }).__perspective = perspective;
