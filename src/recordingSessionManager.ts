@@ -10,6 +10,7 @@ import {
   logFileDescriptorLimits,
   PageDiagnostics,
 } from './diagnostics.js';
+import { withTimeout } from './asyncUtils.js';
 import { muxVideoWithAudio, removeFileIfExists, writeTempFile } from './media.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
@@ -67,6 +68,9 @@ const STAFF_POLL_INTERVAL_MS = 5_000;
 const SESSION_JOIN_TIMEOUT_MS = 300_000;
 const RECORDING_JOIN_ATTEMPTS = 2;
 const RECORDING_JOIN_RETRY_DELAY_MS = 5_000;
+const STOP_AUDIO_COLLECT_TIMEOUT_MS = 20_000;
+const STOP_PAGE_OP_TIMEOUT_MS = 30_000;
+const STOP_CONTEXT_CLOSE_TIMEOUT_MS = 60_000;
 
 function getRecordingResolution(): { width: number; height: number } {
   const raw = process.env.RECORDING_RESOLUTION ?? '960x540';
@@ -548,6 +552,126 @@ export class RecordingSessionManager {
     );
   }
 
+  private async closeRecordingContext(
+    entry: RecordingEntry,
+    workoutClassId: number,
+  ): Promise<{
+    videoPath: string | null;
+    audioBuffer: Buffer | null;
+    audioStartMs: number | null;
+    screenshot?: Buffer;
+  }> {
+    const { page, context, perspective } = entry;
+    const pageClosed = page.isClosed();
+
+    if (pageClosed) {
+      console.warn(
+        `[RecordingWorker] ${perspective} page already closed for class ${workoutClassId} — skipping audio/screenshot`,
+      );
+    }
+
+    const video = pageClosed ? null : page.video();
+    let audioBuffer: Buffer | null = null;
+    let audioStartMs: number | null = null;
+
+    if (!pageClosed) {
+      console.log(
+        `[RecordingWorker] Collecting ${perspective} page audio for class ${workoutClassId}...`,
+      );
+      const audio = await this.collectAudioFromPage(page, perspective);
+      audioBuffer = audio.buffer;
+      audioStartMs = audio.audioStartMs;
+    }
+
+    const screenshot = pageClosed
+      ? undefined
+      : await withTimeout(
+          page.screenshot({ type: 'png' }),
+          STOP_PAGE_OP_TIMEOUT_MS,
+          `${perspective} screenshot for class ${workoutClassId}`,
+        ).catch((err) => {
+          console.warn(
+            `[RecordingWorker] Screenshot failed for ${perspective} class ${workoutClassId}:`,
+            err instanceof Error ? err.message : err,
+          );
+          return undefined;
+        });
+
+    await entry.diagnostics.dispose().catch(() => undefined);
+
+    console.log(
+      `[RecordingWorker] Closing ${perspective} browser context for class ${workoutClassId}...`,
+    );
+    await withTimeout(
+      context.close(),
+      STOP_CONTEXT_CLOSE_TIMEOUT_MS,
+      `${perspective} context close for class ${workoutClassId}`,
+    ).catch((err) => {
+      console.warn(
+        `[RecordingWorker] Context close failed for ${perspective} class ${workoutClassId}:`,
+        err instanceof Error ? err.message : err,
+      );
+    });
+
+    if (!video) {
+      return { videoPath: null, audioBuffer, audioStartMs, screenshot };
+    }
+
+    const videoPath = await withTimeout(
+      video.path(),
+      STOP_PAGE_OP_TIMEOUT_MS,
+      `${perspective} video path for class ${workoutClassId}`,
+    ).catch((err) => {
+      console.warn(
+        `[RecordingWorker] Could not resolve ${perspective} video path for class ${workoutClassId}:`,
+        err instanceof Error ? err.message : err,
+      );
+      return null;
+    });
+
+    return { videoPath, audioBuffer, audioStartMs, screenshot };
+  }
+
+  private async finalizeRecordingEntry(
+    workoutClassId: number,
+    entry: RecordingEntry,
+    videoPath: string,
+    audioBuffer: Buffer | null,
+    audioStartMs: number | null,
+    screenshot?: Buffer,
+  ): Promise<void> {
+    const tempDir = path.dirname(videoPath);
+    console.log(
+      `[RecordingWorker] Preparing ${entry.perspective} upload for class ${workoutClassId}...`,
+    );
+    const uploadPath = await this.prepareUploadVideo(
+      videoPath,
+      audioBuffer,
+      entry.videoRecordingStartMs,
+      audioStartMs,
+    );
+    try {
+      console.log(
+        `[RecordingWorker] Uploading ${entry.perspective} recording for class ${workoutClassId}...`,
+      );
+      await this.uploadRecording(
+        workoutClassId,
+        entry.perspective,
+        uploadPath,
+        screenshot,
+      );
+      console.log(
+        `[RecordingWorker] Uploaded ${entry.perspective} recording for class ${workoutClassId}`,
+      );
+    } finally {
+      await removeFileIfExists(videoPath);
+      if (uploadPath !== videoPath) {
+        await removeFileIfExists(uploadPath);
+      }
+      await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
   async stopClassRecording(workoutClassId: number): Promise<void> {
     const session = this.activeSessions.get(workoutClassId);
     if (!session) {
@@ -557,84 +681,75 @@ export class RecordingSessionManager {
 
     this.stoppingClassIds.add(workoutClassId);
 
-    console.log(
-      `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
-    );
-    await session.corporateSetupPromise.catch((err) => {
-      console.warn(
-        `[RecordingWorker] Corporate setup ended with error for class ${workoutClassId}:`,
-        err,
+    if (this.joinAs === 'trainer' || this.joinAs === 'coach') {
+      console.log(
+        `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
       );
-    });
+      await session.corporateSetupPromise.catch((err) => {
+        console.warn(
+          `[RecordingWorker] Corporate setup ended with error for class ${workoutClassId}:`,
+          err,
+        );
+      });
+    }
 
     this.activeSessions.delete(workoutClassId);
     this.stoppingClassIds.delete(workoutClassId);
 
     try {
-      // Snapshot entries before iterating — the re-join watcher may still push
-      // new contexts to session.entries while we are stopping.
       const entries = [...session.entries];
+      console.log(
+        `[RecordingWorker] Finalizing ${entries.length} recording context(s) for class ${workoutClassId}`,
+      );
+
       for (const entry of entries) {
         try {
-          const { buffer: audioBuffer, audioStartMs } = await this.collectAudioFromPage(
-            entry.page,
-            entry.perspective,
-          );
-          const video = entry.page.video();
-          const screenshot = await entry.page
-            .screenshot({ type: 'png' })
-            .catch(() => undefined);
-          await entry.diagnostics.dispose().catch(() => undefined);
-          await entry.context.close();
-          const videoPath = video ? await video.path() : null;
-          if (videoPath) {
-            const tempDir = path.dirname(videoPath);
-            const uploadPath = await this.prepareUploadVideo(
-              videoPath,
-              audioBuffer,
-              entry.videoRecordingStartMs,
-              audioStartMs,
-            );
-            try {
-              await this.uploadRecording(
-                workoutClassId,
-                entry.perspective,
-                uploadPath,
-                screenshot,
-              );
-            } finally {
-              await removeFileIfExists(videoPath);
-              if (uploadPath !== videoPath) {
-                await removeFileIfExists(uploadPath);
-              }
-              await fs.rm(tempDir, { recursive: true, force: true }).catch(() => undefined);
-            }
-          } else {
+          const { videoPath, audioBuffer, audioStartMs, screenshot } =
+            await this.closeRecordingContext(entry, workoutClassId);
+          if (!videoPath) {
             await this.notifyFailed(workoutClassId, entry.perspective);
+            continue;
           }
+
+          await this.finalizeRecordingEntry(
+            workoutClassId,
+            entry,
+            videoPath,
+            audioBuffer,
+            audioStartMs,
+            screenshot,
+          );
         } catch (err) {
-          console.error('[RecordingWorker] Error closing context:', err);
+          console.error(
+            `[RecordingWorker] Error finalizing ${entry.perspective} context for class ${workoutClassId}:`,
+            err,
+          );
           await entry.diagnostics.dispose().catch(() => undefined);
           await entry.context.close().catch(() => undefined);
           await this.notifyFailed(workoutClassId, entry.perspective);
         }
       }
     } finally {
-      await session.browser.close().catch((err) => {
+      await withTimeout(
+        session.browser.close(),
+        STOP_CONTEXT_CLOSE_TIMEOUT_MS,
+        `browser close for class ${workoutClassId}`,
+      ).catch((err) => {
         console.error(
           `[RecordingWorker] Failed to close browser for class ${workoutClassId}:`,
           err,
         );
       });
       console.log(`[RecordingWorker] Browser closed for class ${workoutClassId}`);
-      // Remove the now-empty per-class temp directory (its per-perspective
-      // subdirs were already deleted after upload) so nothing lingers on disk.
       await fs
         .rm(path.join(getRecordingTmpDir(), String(workoutClassId)), {
           recursive: true,
           force: true,
         })
         .catch(() => undefined);
+      console.log(
+        `[RecordingWorker] Finished stop processing for class ${workoutClassId}`,
+      );
     }
   }
 
@@ -1207,34 +1322,49 @@ export class RecordingSessionManager {
     page: Page,
     perspective: Perspective,
   ): Promise<{ buffer: Buffer | null; audioStartMs: number | null }> {
-    try {
-      await page.evaluate(async () => {
-        const resume = (window as Window & {
-          __resumeRecordingBotAudio?: () => Promise<void>;
-        }).__resumeRecordingBotAudio;
-        if (typeof resume === 'function') {
-          await resume();
-        }
-      });
+    if (page.isClosed()) {
+      console.warn(
+        `[RecordingWorker] Skipping ${perspective} audio collection — page is closed`,
+      );
+      return { buffer: null, audioStartMs: null };
+    }
 
-      const audioResult = await page.evaluate(async () => {
-        const win = window as Window & {
-          __stopRecordingBotAudio?: () => Promise<string | null>;
-          __recordingAudioStartMs?: number;
-        };
-        const audioStartMs =
-          typeof win.__recordingAudioStartMs === 'number'
-            ? win.__recordingAudioStartMs
-            : null;
-        if (typeof win.__stopRecordingBotAudio !== 'function') {
-          return { reason: 'hook-missing' as const, data: null, audioStartMs };
-        }
-        const data = await win.__stopRecordingBotAudio();
-        if (!data) {
-          return { reason: 'empty-blob' as const, data: null, audioStartMs };
-        }
-        return { reason: 'ok' as const, data, audioStartMs };
-      });
+    try {
+      await withTimeout(
+        page.evaluate(async () => {
+          const resume = (window as Window & {
+            __resumeRecordingBotAudio?: () => Promise<void>;
+          }).__resumeRecordingBotAudio;
+          if (typeof resume === 'function') {
+            await resume();
+          }
+        }),
+        STOP_AUDIO_COLLECT_TIMEOUT_MS,
+        `${perspective} audio resume`,
+      );
+
+      const audioResult = await withTimeout(
+        page.evaluate(async () => {
+          const win = window as Window & {
+            __stopRecordingBotAudio?: () => Promise<string | null>;
+            __recordingAudioStartMs?: number;
+          };
+          const audioStartMs =
+            typeof win.__recordingAudioStartMs === 'number'
+              ? win.__recordingAudioStartMs
+              : null;
+          if (typeof win.__stopRecordingBotAudio !== 'function') {
+            return { reason: 'hook-missing' as const, data: null, audioStartMs };
+          }
+          const data = await win.__stopRecordingBotAudio();
+          if (!data) {
+            return { reason: 'empty-blob' as const, data: null, audioStartMs };
+          }
+          return { reason: 'ok' as const, data, audioStartMs };
+        }),
+        STOP_AUDIO_COLLECT_TIMEOUT_MS,
+        `${perspective} audio stop`,
+      );
 
       if (audioResult.reason === 'hook-missing') {
         console.warn(

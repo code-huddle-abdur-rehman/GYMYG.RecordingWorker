@@ -178,7 +178,16 @@ const stopWorker = new Worker(
       return;
     }
 
-    await sessionManager.stopClassRecording(workoutClassId);
+    try {
+      await sessionManager.stopClassRecording(workoutClassId);
+    } catch (err) {
+      console.error(
+        `[RecordingWorker] Stop processing failed for class ${workoutClassId}:`,
+        err instanceof Error ? err.message : err,
+      );
+      await sessionManager.forceCloseSession(workoutClassId);
+      throw err;
+    }
   },
   STOP_WORKER_OPTS,
 );
