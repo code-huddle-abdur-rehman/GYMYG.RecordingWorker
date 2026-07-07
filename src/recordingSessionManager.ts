@@ -1,4 +1,5 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
+import { Upload } from '@aws-sdk/lib-storage';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -11,7 +12,7 @@ import {
   PageDiagnostics,
 } from './diagnostics.js';
 import { withTimeout } from './asyncUtils.js';
-import { muxVideoWithAudio, removeFileIfExists, writeTempFile } from './media.js';
+import { finalizeWebmContainer, muxVideoWithAudio, removeFileIfExists, writeTempFile } from './media.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
 type StaffRole = 'trainer' | 'coach';
@@ -1397,12 +1398,28 @@ export class RecordingSessionManager {
     videoRecordingStartMs: number,
     audioStartMs: number | null,
   ): Promise<string> {
+    const tempDir = path.dirname(videoPath);
+
     if (!audioBuffer || audioBuffer.length === 0) {
-      console.warn('[RecordingWorker] Uploading video without audio track');
-      return videoPath;
+      // No audio captured — still run a container-finalization pass so ffmpeg
+      // writes the Duration and Cues (seek-index) elements.  Without this the
+      // file has Duration: N/A and browsers treat it as a live stream (no
+      // end-time, cannot seek to the end).  This is especially common when
+      // context.close() timed out and Chromium never finalized the WebM file.
+      const finalizedPath = path.join(tempDir, `finalized-${uuidv4()}.webm`);
+      try {
+        await finalizeWebmContainer(videoPath, finalizedPath);
+        console.log('[RecordingWorker] Finalized video-only container (duration metadata written)');
+        return finalizedPath;
+      } catch (err) {
+        console.warn(
+          '[RecordingWorker] Container finalization failed, uploading raw video:',
+          err instanceof Error ? err.message : err,
+        );
+        return videoPath;
+      }
     }
 
-    const tempDir = path.dirname(videoPath);
     const audioPath = await writeTempFile(tempDir, `audio-${uuidv4()}.webm`, audioBuffer);
     const outputPath = path.join(tempDir, `muxed-${uuidv4()}.webm`);
 
@@ -1431,10 +1448,18 @@ export class RecordingSessionManager {
       return outputPath;
     } catch (err) {
       console.warn(
-        '[RecordingWorker] Failed to mux audio into video, uploading video-only file:',
-        err,
+        '[RecordingWorker] Failed to mux audio into video, falling back to finalized video-only:',
+        err instanceof Error ? err.message : err,
       );
-      return videoPath;
+      // Mux failed — still try to finalize the container so the video is seekable.
+      const finalizedPath = path.join(tempDir, `finalized-${uuidv4()}.webm`);
+      try {
+        await finalizeWebmContainer(videoPath, finalizedPath);
+        console.log('[RecordingWorker] Finalized container after mux failure');
+        return finalizedPath;
+      } catch {
+        return videoPath;
+      }
     } finally {
       await removeFileIfExists(audioPath);
     }
@@ -1469,16 +1494,25 @@ export class RecordingSessionManager {
     const s3Key = `${prefix}/${workoutClassId}/${perspective}/${fileId}.webm`;
     const thumbnailKey = `${prefix}/${workoutClassId}/${perspective}/${fileId}-thumb.png`;
 
-    const fileBuffer = await fs.readFile(videoPath);
-    await this.s3.send(
-      new PutObjectCommand({
+    // Stream the file via multipart upload instead of loading it all into memory.
+    // PutObjectCommand with a large Buffer causes EPIPE / connection-reset errors
+    // on long recordings (hundreds of MB) because a single HTTP PUT times out
+    // mid-stream.  The Upload class splits the file into ~10 MB parts, retries
+    // each part independently, and does not hold the whole file in RAM.
+    const fileStream = (await import('fs')).createReadStream(videoPath);
+    const upload = new Upload({
+      client: this.s3,
+      queueSize: 4,
+      partSize: 10 * 1024 * 1024,
+      params: {
         Bucket: bucket,
         Key: s3Key,
-        Body: fileBuffer,
+        Body: fileStream,
         ContentType: 'video/webm',
         ACL: 'public-read',
-      }),
-    );
+      },
+    });
+    await upload.done();
 
     let uploadedThumbnailKey: string | undefined;
     if (screenshot) {

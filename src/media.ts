@@ -70,6 +70,31 @@ export async function muxVideoWithAudio(
   }
 }
 
+/**
+ * Re-containerizes a WebM file with a stream-copy pass so ffmpeg can write
+ * proper Duration and Cues metadata into the output container.
+ *
+ * Playwright's Chromium screencast writes VP8/VP9 frames without a Duration
+ * element in the Segment Info header, and without a Cues (seek-index) element.
+ * When `context.close()` is killed or times out, Chromium never gets the chance
+ * to finalize the file — the Duration stays "N/A" and browsers treat the result
+ * as a live stream (no end-time, no seeking to the end).  A single `-c:v copy`
+ * pass forces ffmpeg to scan the entire file, compute the real duration, and
+ * write it together with a Cues index into the output.
+ */
+export async function finalizeWebmContainer(
+  inputPath: string,
+  outputPath: string,
+): Promise<void> {
+  const ffmpeg = getFfmpegPath();
+  await execFileAsync(ffmpeg, [
+    '-y',
+    '-i', inputPath,
+    '-c:v', 'copy',
+    outputPath,
+  ]);
+}
+
 export async function writeTempFile(
   dir: string,
   filename: string,
