@@ -113,7 +113,27 @@ async function waitForActiveSession(
 
 console.log('[RecordingWorker] Starting workers...');
 
-new Worker(
+const START_WORKER_OPTS = {
+  connection,
+  concurrency: 1,
+  // Start jobs can involve browser launch/login and may run for minutes.
+  // Keep a generous lock to reduce false stalls during transient Redis jitter.
+  lockDuration: 300_000,
+  stalledInterval: 60_000,
+  maxStalledCount: 2,
+};
+
+const STOP_WORKER_OPTS = {
+  connection,
+  concurrency: 1,
+  // Stop jobs can be lengthy (close contexts, collect audio, mux, upload to S3).
+  // A longer lock window prevents "could not renew lock" on slow hosts.
+  lockDuration: 900_000,
+  stalledInterval: 60_000,
+  maxStalledCount: 2,
+};
+
+const startWorker = new Worker(
   startQueueName,
   async (job) => {
     const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
@@ -138,10 +158,10 @@ new Worker(
       startJobsInFlight.delete(workoutClassId);
     }
   },
-  { connection, concurrency: 1 },
+  START_WORKER_OPTS,
 );
 
-new Worker(
+const stopWorker = new Worker(
   stopQueueName,
   async (job) => {
     const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
@@ -160,8 +180,34 @@ new Worker(
 
     await sessionManager.stopClassRecording(workoutClassId);
   },
-  { connection, concurrency: 1 },
+  STOP_WORKER_OPTS,
 );
+
+startWorker.on('error', (err) => {
+  console.error('[RecordingWorker] Start worker error:', err);
+});
+startWorker.on('stalled', (jobId) => {
+  console.warn(`[RecordingWorker] Start worker stalled job ${jobId}`);
+});
+startWorker.on('failed', (job, err) => {
+  console.error(`[RecordingWorker] Start worker failed job ${job?.id}:`, err);
+});
+startWorker.on('completed', (job) => {
+  console.log(`[RecordingWorker] Start worker completed job ${job.id}`);
+});
+
+stopWorker.on('error', (err) => {
+  console.error('[RecordingWorker] Stop worker error:', err);
+});
+stopWorker.on('stalled', (jobId) => {
+  console.warn(`[RecordingWorker] Stop worker stalled job ${jobId}`);
+});
+stopWorker.on('failed', (job, err) => {
+  console.error(`[RecordingWorker] Stop worker failed job ${job?.id}:`, err);
+});
+stopWorker.on('completed', (job) => {
+  console.log(`[RecordingWorker] Stop worker completed job ${job.id}`);
+});
 
 console.log(
   `[RecordingWorker] Listening on ${startQueueName} and ${stopQueueName}`,
