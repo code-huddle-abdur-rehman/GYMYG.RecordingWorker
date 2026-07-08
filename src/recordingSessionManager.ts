@@ -69,7 +69,13 @@ const STAFF_POLL_INTERVAL_MS = 5_000;
 const SESSION_JOIN_TIMEOUT_MS = 300_000;
 const RECORDING_JOIN_ATTEMPTS = 2;
 const RECORDING_JOIN_RETRY_DELAY_MS = 5_000;
-const STOP_AUDIO_COLLECT_TIMEOUT_MS = 20_000;
+// Stopping the in-page MediaRecorder and pulling the captured audio back out as
+// base64 scales with recording length: a multi-hour class produces a far larger
+// blob than a short re-join segment, and on a loaded host (several concurrent
+// classes → high load average) the single page.evaluate() call can take well
+// over 20s. Too small a budget here silently drops the audio and uploads a
+// video-only recording, so give it room to finish.
+const STOP_AUDIO_COLLECT_TIMEOUT_MS = 60_000;
 const STOP_PAGE_OP_TIMEOUT_MS = 30_000;
 const STOP_CONTEXT_CLOSE_TIMEOUT_MS = 60_000;
 
@@ -703,12 +709,20 @@ export class RecordingSessionManager {
         `[RecordingWorker] Finalizing ${entries.length} recording context(s) for class ${workoutClassId}`,
       );
 
+      // A class can hold several contexts for the same perspective (rejoins).
+      // The server keeps a single recording row per perspective, so we must
+      // NOT let one segment's failure overwrite another segment's successful
+      // upload. Track which perspectives produced at least one good upload and
+      // only report "failed" for perspectives where every segment failed.
+      const succeededPerspectives = new Set<Perspective>();
+      const attemptedPerspectives = new Set<Perspective>();
+
       for (const entry of entries) {
+        attemptedPerspectives.add(entry.perspective);
         try {
           const { videoPath, audioBuffer, audioStartMs, screenshot } =
             await this.closeRecordingContext(entry, workoutClassId);
           if (!videoPath) {
-            await this.notifyFailed(workoutClassId, entry.perspective);
             continue;
           }
 
@@ -720,6 +734,7 @@ export class RecordingSessionManager {
             audioStartMs,
             screenshot,
           );
+          succeededPerspectives.add(entry.perspective);
         } catch (err) {
           console.error(
             `[RecordingWorker] Error finalizing ${entry.perspective} context for class ${workoutClassId}:`,
@@ -727,7 +742,15 @@ export class RecordingSessionManager {
           );
           await entry.diagnostics.dispose().catch(() => undefined);
           await entry.context.close().catch(() => undefined);
-          await this.notifyFailed(workoutClassId, entry.perspective);
+        }
+      }
+
+      for (const perspective of attemptedPerspectives) {
+        if (!succeededPerspectives.has(perspective)) {
+          console.warn(
+            `[RecordingWorker] No successful ${perspective} upload for class ${workoutClassId} — marking failed`,
+          );
+          await this.notifyFailed(workoutClassId, perspective);
         }
       }
     } finally {
@@ -970,10 +993,18 @@ export class RecordingSessionManager {
     videoDir: string;
   }> {
     const videoRecordingStartMs = Date.now();
+    // Each context gets its OWN unique sub-directory (…/<classId>/<perspective>/<uuid>).
+    // A class can produce several contexts for the same perspective (e.g. the
+    // trainer leaves and re-joins → a fresh recording context is opened). If
+    // those contexts shared one directory, finalizing the first one would
+    // `fs.rm` the shared folder and delete the *other* context's video/audio
+    // files mid-flight — causing ENOENT and a spurious "failed" upload. Keeping
+    // each context isolated means one segment's cleanup can never touch another.
     const videoDir = path.join(
       getRecordingTmpDir(),
       String(workoutClassId),
       perspective,
+      uuidv4(),
     );
     await fs.mkdir(videoDir, { recursive: true });
 
