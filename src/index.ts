@@ -1,6 +1,6 @@
 import 'dotenv/config';
 import { Queue, Worker } from 'bullmq';
-import { parseRedisUrl } from './redis.js';
+import { buildRedisConnection } from './redis.js';
 import {
   cleanupRecordingTmpDir,
   getRecordingTmpDir,
@@ -43,7 +43,7 @@ if (!redisUrl) {
   throw new Error('REDIS_URL is required');
 }
 
-const connection = parseRedisUrl(redisUrl);
+const connection = buildRedisConnection(redisUrl);
 const sessionManager = new RecordingSessionManager();
 const joinAs = sessionManager.joinAs;
 const startQueueName = classRecordingStartQueue(joinAs);
@@ -217,6 +217,73 @@ stopWorker.on('failed', (job, err) => {
 stopWorker.on('completed', (job) => {
   console.log(`[RecordingWorker] Stop worker completed job ${job.id}`);
 });
+
+// ── Redis connection lifecycle logging ────────────────────────────────────────
+// Surfaces the underlying ioredis connection state so a Redis failover is
+// clearly visible in the logs (connect → close → reconnecting → ready), rather
+// than only showing up as a burst of "worker error: READONLY" lines. The
+// reconnectOnError handler in redis.ts logs the moment a failover is detected;
+// these listeners show the recovery that follows.
+type RedisEventClient = {
+  on(event: string, listener: (...args: unknown[]) => void): unknown;
+  status?: string;
+};
+
+async function attachRedisConnectionLogging(
+  label: string,
+  clientPromise: Promise<RedisEventClient>,
+): Promise<void> {
+  try {
+    const client = await clientPromise;
+    client.on('connect', () =>
+      console.log(`[RecordingWorker][redis] ${label} socket connecting...`),
+    );
+    client.on('ready', () =>
+      console.log(`[RecordingWorker][redis] ${label} connection ready`),
+    );
+    client.on('reconnecting', (delay: unknown) =>
+      console.warn(
+        `[RecordingWorker][redis] ${label} reconnecting${
+          typeof delay === 'number' ? ` (next attempt in ${delay}ms)` : ''
+        }...`,
+      ),
+    );
+    client.on('close', () =>
+      console.warn(`[RecordingWorker][redis] ${label} connection closed`),
+    );
+    client.on('end', () =>
+      console.warn(
+        `[RecordingWorker][redis] ${label} connection ended (no more reconnects)`,
+      ),
+    );
+    client.on('error', (err: unknown) =>
+      console.error(
+        `[RecordingWorker][redis] ${label} connection error:`,
+        err instanceof Error ? err.message : err,
+      ),
+    );
+  } catch (err) {
+    console.error(
+      `[RecordingWorker][redis] Failed to attach connection logging for ${label}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+}
+
+// The blocking connection (used by bzpopmin to fetch jobs) is the one demoted
+// on a failover; BullMQ re-emits 'ready' once it has reconnected to the new
+// primary and can pull jobs again.
+startWorker.on('ready', () =>
+  console.log('[RecordingWorker][redis] start worker ready to fetch jobs'),
+);
+stopWorker.on('ready', () =>
+  console.log('[RecordingWorker][redis] stop worker ready to fetch jobs'),
+);
+
+void attachRedisConnectionLogging('start-queue', startQueue.client);
+void attachRedisConnectionLogging('stop-queue', stopQueue.client);
+void attachRedisConnectionLogging('start-worker', startWorker.client);
+void attachRedisConnectionLogging('stop-worker', stopWorker.client);
 
 console.log(
   `[RecordingWorker] Listening on ${startQueueName} and ${stopQueueName}`,

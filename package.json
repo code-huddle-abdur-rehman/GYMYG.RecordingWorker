@@ -14,6 +14,7 @@
     "bullmq": "^5.34.5",
     "dotenv": "^16.4.5",
     "ffmpeg-static": "^5.3.0",
+    "ioredis": "^5.10.1",
     "playwright": "^1.49.1",
     "uuid": "^11.0.3"
   },
