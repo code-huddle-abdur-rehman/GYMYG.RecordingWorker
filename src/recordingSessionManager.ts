@@ -388,7 +388,7 @@ export class RecordingSessionManager {
 
     try {
       browser = await chromium.launch({
-        headless: false,
+        headless: true,
         // Playwright injects --disable-dev-shm-usage by default; strip it so
         // Chromium uses the (empty, adequately-sized) /dev/shm instead of the
         // congested /tmp tmpfs. See getChromiumLaunchArgs for the rationale.
