@@ -1,5 +1,6 @@
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { Upload } from '@aws-sdk/lib-storage';
+import { createWriteStream } from 'fs';
 import { promises as fs } from 'fs';
 import os from 'os';
 import path from 'path';
@@ -12,7 +13,8 @@ import {
   PageDiagnostics,
 } from './diagnostics.js';
 import { withTimeout } from './asyncUtils.js';
-import { finalizeWebmContainer, muxVideoWithAudio, removeFileIfExists, writeTempFile } from './media.js';
+import { finalizeWebmContainer, muxVideoWithAudio, removeFileIfExists } from './media.js';
+import type { JoinAsMode } from './queues.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
 type StaffRole = 'trainer' | 'coach';
@@ -42,6 +44,9 @@ interface RecordingEntry {
   perspective: Perspective;
   videoRecordingStartMs: number;
   diagnostics: PageDiagnostics;
+  audioFilePath: string;
+  flushAudio: () => Promise<void>;
+  destroyAudio: () => void;
 }
 
 interface ActiveSession {
@@ -208,7 +213,7 @@ function isRecordingJoinPageReady(): boolean {
 }
 
 export class RecordingSessionManager {
-  readonly joinAs: Perspective;
+  readonly joinAs: JoinAsMode;
 
   private activeSessions = new Map<number, ActiveSession>();
   private stoppingClassIds = new Set<number>();
@@ -227,12 +232,28 @@ export class RecordingSessionManager {
     this.joinAs = this.parseJoinAs();
   }
 
-  private parseJoinAs(): Perspective {
+  private parseJoinAs(): JoinAsMode {
     const value = process.env.JOIN_AS?.trim().toLowerCase();
-    if (!value || !['client', 'trainer', 'coach'].includes(value)) {
-      throw new Error('JOIN_AS must be set to one of: client, trainer, coach');
+    if (!value || !['client', 'trainer', 'coach', 'all'].includes(value)) {
+      throw new Error('JOIN_AS must be set to one of: client, trainer, coach, all');
     }
-    return value as Perspective;
+    return value as JoinAsMode;
+  }
+
+  private recordsClient(): boolean {
+    return this.joinAs === 'client' || this.joinAs === 'all';
+  }
+
+  private recordsTrainer(): boolean {
+    return this.joinAs === 'trainer' || this.joinAs === 'all';
+  }
+
+  private recordsCoach(): boolean {
+    return this.joinAs === 'coach' || this.joinAs === 'all';
+  }
+
+  private recordsCorporate(): boolean {
+    return this.recordsTrainer() || this.recordsCoach();
   }
 
   private get apiBase() {
@@ -367,7 +388,7 @@ export class RecordingSessionManager {
 
     try {
       browser = await chromium.launch({
-        headless: true,
+        headless: false,
         // Playwright injects --disable-dev-shm-usage by default; strip it so
         // Chromium uses the (empty, adequately-sized) /dev/shm instead of the
         // congested /tmp tmpfs. See getChromiumLaunchArgs for the rationale.
@@ -388,7 +409,7 @@ export class RecordingSessionManager {
         );
       });
 
-      if (this.joinAs === 'client') {
+      if (this.recordsClient()) {
         const clientAuthSession = await this.loginRecordingBot();
         console.log('[RecordingWorker] Recording bot authenticated as client');
 
@@ -413,12 +434,16 @@ export class RecordingSessionManager {
         corporateSetupPromise: Promise.resolve(),
       };
 
-      if (this.joinAs === 'trainer' || this.joinAs === 'coach') {
-        session.corporateSetupPromise = this.startCorporateRecordingBots(
-          workoutClassId,
-          session,
-          this.joinAs,
-        );
+      if (this.recordsCorporate()) {
+        const corporateRoles: StaffRole[] = [];
+        if (this.recordsTrainer()) corporateRoles.push('trainer');
+        if (this.recordsCoach()) corporateRoles.push('coach');
+
+        session.corporateSetupPromise = Promise.all(
+          corporateRoles.map((role) =>
+            this.startCorporateRecordingBots(workoutClassId, session, role),
+          ),
+        ).then(() => undefined);
       }
 
       this.activeSessions.set(workoutClassId, session);
@@ -564,7 +589,7 @@ export class RecordingSessionManager {
     workoutClassId: number,
   ): Promise<{
     videoPath: string | null;
-    audioBuffer: Buffer | null;
+    audioFilePath: string;
     audioStartMs: number | null;
     screenshot?: Buffer;
   }> {
@@ -578,17 +603,22 @@ export class RecordingSessionManager {
     }
 
     const video = pageClosed ? null : page.video();
-    let audioBuffer: Buffer | null = null;
-    let audioStartMs: number | null = null;
 
-    if (!pageClosed) {
-      console.log(
-        `[RecordingWorker] Collecting ${perspective} page audio for class ${workoutClassId}...`,
-      );
-      const audio = await this.collectAudioFromPage(page, perspective);
-      audioBuffer = audio.buffer;
-      audioStartMs = audio.audioStartMs;
-    }
+    console.log(
+      `[RecordingWorker] Flushing ${perspective} audio stream for class ${workoutClassId}...`,
+    );
+    await entry.flushAudio();
+
+    const audioStartMs = !pageClosed
+      ? await page
+          .evaluate(
+            () =>
+              (
+                window as Window & { __recordingAudioStartMs?: number }
+              ).__recordingAudioStartMs ?? null,
+          )
+          .catch(() => null)
+      : null;
 
     const screenshot = pageClosed
       ? undefined
@@ -621,7 +651,7 @@ export class RecordingSessionManager {
     });
 
     if (!video) {
-      return { videoPath: null, audioBuffer, audioStartMs, screenshot };
+      return { videoPath: null, audioFilePath: entry.audioFilePath, audioStartMs, screenshot };
     }
 
     const videoPath = await withTimeout(
@@ -636,14 +666,14 @@ export class RecordingSessionManager {
       return null;
     });
 
-    return { videoPath, audioBuffer, audioStartMs, screenshot };
+    return { videoPath, audioFilePath: entry.audioFilePath, audioStartMs, screenshot };
   }
 
   private async finalizeRecordingEntry(
     workoutClassId: number,
     entry: RecordingEntry,
     videoPath: string,
-    audioBuffer: Buffer | null,
+    audioFilePath: string,
     audioStartMs: number | null,
     screenshot?: Buffer,
   ): Promise<void> {
@@ -653,7 +683,7 @@ export class RecordingSessionManager {
     );
     const uploadPath = await this.prepareUploadVideo(
       videoPath,
-      audioBuffer,
+      audioFilePath,
       entry.videoRecordingStartMs,
       audioStartMs,
     );
@@ -688,7 +718,7 @@ export class RecordingSessionManager {
 
     this.stoppingClassIds.add(workoutClassId);
 
-    if (this.joinAs === 'trainer' || this.joinAs === 'coach') {
+    if (this.recordsCorporate()) {
       console.log(
         `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
       );
@@ -720,7 +750,7 @@ export class RecordingSessionManager {
       for (const entry of entries) {
         attemptedPerspectives.add(entry.perspective);
         try {
-          const { videoPath, audioBuffer, audioStartMs, screenshot } =
+          const { videoPath, audioFilePath, audioStartMs, screenshot } =
             await this.closeRecordingContext(entry, workoutClassId);
           if (!videoPath) {
             continue;
@@ -730,7 +760,7 @@ export class RecordingSessionManager {
             workoutClassId,
             entry,
             videoPath,
-            audioBuffer,
+            audioFilePath,
             audioStartMs,
             screenshot,
           );
@@ -991,6 +1021,9 @@ export class RecordingSessionManager {
     videoRecordingStartMs: number;
     diagnostics: PageDiagnostics;
     videoDir: string;
+    audioFilePath: string;
+    flushAudio: () => Promise<void>;
+    destroyAudio: () => void;
   }> {
     const videoRecordingStartMs = Date.now();
     // Each context gets its OWN unique sub-directory (…/<classId>/<perspective>/<uuid>).
@@ -1088,7 +1121,75 @@ export class RecordingSessionManager {
       void diagnostics.logCrashReport('page "crash" event fired');
     });
 
-    return { context, page, videoRecordingStartMs, diagnostics, videoDir };
+    // ── Chunked audio streaming ───────────────────────────────────────────────
+    // Each 1-second MediaRecorder timeslice (~16 KB) is written to disk
+    // immediately via exposeFunction, avoiding the end-of-class blob transfer
+    // that could exceed STOP_AUDIO_COLLECT_TIMEOUT_MS on loaded hosts.
+    const audioFilePath = path.join(videoDir, `audio-${uuidv4()}.webm`);
+    const audioStream = createWriteStream(audioFilePath, { flags: 'a' });
+    audioStream.on('error', (err) =>
+      console.error(
+        `[RecordingWorker] Audio stream error for class ${workoutClassId} (${perspective}):`,
+        err,
+      ),
+    );
+    let totalAudioBytes = 0;
+    let audioStreamClosed = false;
+    const audioStreamDone = new Promise<void>((resolve) => {
+      audioStream.on('finish', resolve);
+      audioStream.on('error', () => resolve());
+    });
+
+    await context.exposeFunction('__saveAudioChunk', async (b64: string) => {
+      if (!b64 || audioStreamClosed) return;
+      const chunk = Buffer.from(b64, 'base64');
+      totalAudioBytes += chunk.byteLength;
+      audioStream.write(chunk);
+    });
+
+    await context.exposeFunction('__finishAudioRecording', async () => {
+      if (!audioStreamClosed) {
+        audioStreamClosed = true;
+        audioStream.end();
+      }
+      await audioStreamDone;
+      console.log(
+        `[RecordingWorker] Audio stream closed for class ${workoutClassId} (${perspective}) — ` +
+          `${(totalAudioBytes / 1024).toFixed(1)} KB on disk`,
+      );
+    });
+
+    const flushAudio = async () => {
+      if (!page.isClosed()) {
+        await withTimeout(
+          page.evaluate(async () => {
+            await (
+              window as Window & {
+                __stopRecordingBotAudio?: () => Promise<unknown>;
+              }
+            ).__stopRecordingBotAudio?.();
+          }),
+          STOP_AUDIO_COLLECT_TIMEOUT_MS,
+          `${perspective} audio flush for class ${workoutClassId}`,
+        ).catch((err) =>
+          console.warn(
+            `[RecordingWorker] Audio flush failed for ${perspective} class ${workoutClassId}:`,
+            err,
+          ),
+        );
+      } else if (!audioStreamClosed) {
+        audioStreamClosed = true;
+        audioStream.end();
+      }
+      await audioStreamDone;
+    };
+
+    const destroyAudio = () => {
+      audioStreamClosed = true;
+      audioStream.destroy();
+    };
+
+    return { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio };
   }
 
   private async openClientRecordingContext(
@@ -1100,7 +1201,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics, videoDir } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio } =
         await this.createRecordingContext(browser, workoutClassId, 'client');
       // Sample resource usage throughout the join — this is when crashes occur.
       diagnostics.startSampling();
@@ -1121,12 +1222,13 @@ export class RecordingSessionManager {
 
         await this.waitForSessionJoined(page, 'client', false, diagnostics);
         diagnostics.stopSampling();
-        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics };
+        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics, audioFilePath, flushAudio, destroyAudio };
       } catch (err) {
         await diagnostics.logCrashReport(
           `client join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
         await diagnostics.dispose();
+        destroyAudio();
         await context.close().catch(() => undefined);
         // Discard the partial recording so it doesn't accumulate on disk.
         await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
@@ -1156,7 +1258,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics, videoDir } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio } =
         await this.createRecordingContext(browser, workoutClassId, perspective);
       diagnostics.startSampling();
 
@@ -1185,12 +1287,13 @@ export class RecordingSessionManager {
 
         await this.waitForSessionJoined(page, perspective, true, diagnostics);
         diagnostics.stopSampling();
-        return { context, page, perspective, videoRecordingStartMs, diagnostics };
+        return { context, page, perspective, videoRecordingStartMs, diagnostics, audioFilePath, flushAudio, destroyAudio };
       } catch (err) {
         await diagnostics.logCrashReport(
           `${perspective} corporate join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
         await diagnostics.dispose();
+        destroyAudio();
         await context.close().catch(() => undefined);
         // Discard the partial recording so it doesn't accumulate on disk.
         await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
@@ -1425,13 +1528,14 @@ export class RecordingSessionManager {
 
   private async prepareUploadVideo(
     videoPath: string,
-    audioBuffer: Buffer | null,
+    audioFilePath: string,
     videoRecordingStartMs: number,
     audioStartMs: number | null,
   ): Promise<string> {
     const tempDir = path.dirname(videoPath);
 
-    if (!audioBuffer || audioBuffer.length === 0) {
+    const audioStat = await fs.stat(audioFilePath).catch(() => null);
+    if (!audioStat || audioStat.size === 0) {
       // No audio captured — still run a container-finalization pass so ffmpeg
       // writes the Duration and Cues (seek-index) elements.  Without this the
       // file has Duration: N/A and browsers treat it as a live stream (no
@@ -1451,7 +1555,7 @@ export class RecordingSessionManager {
       }
     }
 
-    const audioPath = await writeTempFile(tempDir, `audio-${uuidv4()}.webm`, audioBuffer);
+    const audioPath = audioFilePath; // already streamed to disk chunk-by-chunk
     const outputPath = path.join(tempDir, `muxed-${uuidv4()}.webm`);
 
     const videoTrimSeconds =
@@ -1601,8 +1705,11 @@ export class RecordingSessionManager {
     return this.activeSessions.has(workoutClassId);
   }
 
-  async notifySessionMissing(workoutClassId: number): Promise<void> {
-    const url = `${this.apiBase}/class-recording/worker/session-missing/${workoutClassId}/${this.joinAs}`;
+  async notifySessionMissing(
+    workoutClassId: number,
+    perspective: Perspective,
+  ): Promise<void> {
+    const url = `${this.apiBase}/class-recording/worker/session-missing/${workoutClassId}/${perspective}`;
     await fetch(url, {
       method: 'POST',
       headers: { 'x-recording-worker-key': this.workerKey },

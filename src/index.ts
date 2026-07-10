@@ -10,6 +10,8 @@ import { collectSystemResources, logFileDescriptorLimits } from './diagnostics.j
 import {
   classRecordingStartQueue,
   classRecordingStopQueue,
+  RECORDING_ROLES,
+  type RecordingRole,
 } from './queues.js';
 
 // ── File-descriptor limit check ───────────────────────────────────────────────
@@ -46,16 +48,20 @@ if (!redisUrl) {
 const connection = buildRedisConnection(redisUrl);
 const sessionManager = new RecordingSessionManager();
 const joinAs = sessionManager.joinAs;
-const startQueueName = classRecordingStartQueue(joinAs);
-const stopQueueName = classRecordingStopQueue(joinAs);
+const queueRoles: RecordingRole[] =
+  joinAs === 'all' ? [...RECORDING_ROLES] : [joinAs];
 
 console.log(`[RecordingWorker] JOIN_AS=${joinAs}`);
-console.log(`[RecordingWorker] Start queue: ${startQueueName}`);
-console.log(`[RecordingWorker] Stop queue: ${stopQueueName}`);
+for (const role of queueRoles) {
+  console.log(
+    `[RecordingWorker] Queues: ${classRecordingStartQueue(role)}, ${classRecordingStopQueue(role)}`,
+  );
+}
 
 const startJobsInFlight = new Map<number, Promise<void>>();
-const startQueue = new Queue(startQueueName, { connection });
-const stopQueue = new Queue(stopQueueName, { connection });
+const stopJobsInFlight = new Set<number>();
+const queues: Queue[] = [];
+const workers: Worker[] = [];
 
 let shuttingDown = false;
 
@@ -64,7 +70,10 @@ async function shutdown(signal: string) {
   shuttingDown = true;
   console.log(`[RecordingWorker] ${signal} received — closing browsers...`);
   await sessionManager.closeAllSessions();
-  await Promise.all([startQueue.close(), stopQueue.close()]);
+  await Promise.all([
+    ...queues.map((queue) => queue.close()),
+    ...workers.map((worker) => worker.close()),
+  ]);
   process.exit(0);
 }
 
@@ -73,6 +82,7 @@ process.on('SIGTERM', () => void shutdown('SIGTERM'));
 
 async function waitForActiveSession(
   workoutClassId: number,
+  startQueue: Queue,
   maxWaitMs = 180000,
 ): Promise<boolean> {
   const deadline = Date.now() + maxWaitMs;
@@ -133,90 +143,146 @@ const STOP_WORKER_OPTS = {
   maxStalledCount: 2,
 };
 
-const startWorker = new Worker(
-  startQueueName,
-  async (job) => {
-    const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
-    console.log(
-      `[RecordingWorker] Start ${joinAs} recording for class ${workoutClassId}`,
-    );
-    const startPromise = sessionManager.startClassRecording(workoutClassId);
-    startJobsInFlight.set(workoutClassId, startPromise);
-    try {
-      await startPromise;
+for (const queueRole of queueRoles) {
+  const startQueueName = classRecordingStartQueue(queueRole);
+  const stopQueueName = classRecordingStopQueue(queueRole);
+  const startQueue = new Queue(startQueueName, { connection });
+  const stopQueue = new Queue(stopQueueName, { connection });
+  queues.push(startQueue, stopQueue);
+
+  const startWorker = new Worker(
+    startQueueName,
+    async (job) => {
+      const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
+
+      if (sessionManager.hasSession(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Class ${workoutClassId} already recording — ignoring duplicate ${queueRole} start job`,
+        );
+        return;
+      }
+
+      const existingStart = startJobsInFlight.get(workoutClassId);
+      if (existingStart) {
+        console.log(
+          `[RecordingWorker] Start already in flight for class ${workoutClassId} — waiting on ${queueRole} start job`,
+        );
+        await existingStart;
+        return;
+      }
+
       console.log(
-        `[RecordingWorker] ${joinAs} recording session ready for class ${workoutClassId}`,
+        `[RecordingWorker] Start ${joinAs} recording for class ${workoutClassId} (triggered by ${queueRole} queue)`,
       );
-    } catch (err) {
-      console.error(
-        `[RecordingWorker] Failed to start ${joinAs} recording for class ${workoutClassId}:`,
-        err instanceof Error ? err.message : err,
-      );
-      await sessionManager.forceCloseSession(workoutClassId);
-      throw err;
-    } finally {
-      startJobsInFlight.delete(workoutClassId);
-    }
-  },
-  START_WORKER_OPTS,
-);
+      const startPromise = sessionManager.startClassRecording(workoutClassId);
+      startJobsInFlight.set(workoutClassId, startPromise);
+      try {
+        await startPromise;
+        console.log(
+          `[RecordingWorker] ${joinAs} recording session ready for class ${workoutClassId}`,
+        );
+      } catch (err) {
+        console.error(
+          `[RecordingWorker] Failed to start ${joinAs} recording for class ${workoutClassId}:`,
+          err instanceof Error ? err.message : err,
+        );
+        await sessionManager.forceCloseSession(workoutClassId);
+        throw err;
+      } finally {
+        startJobsInFlight.delete(workoutClassId);
+      }
+    },
+    START_WORKER_OPTS,
+  );
 
-const stopWorker = new Worker(
-  stopQueueName,
-  async (job) => {
-    const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
-    console.log(
-      `[RecordingWorker] Stop ${joinAs} recording for class ${workoutClassId}`,
+  const stopWorker = new Worker(
+    stopQueueName,
+    async (job) => {
+      const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
+
+      if (stopJobsInFlight.has(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Stop already in progress for class ${workoutClassId} — ignoring duplicate ${queueRole} stop job`,
+        );
+        return;
+      }
+
+      console.log(
+        `[RecordingWorker] Stop ${joinAs} recording for class ${workoutClassId} (triggered by ${queueRole} queue)`,
+      );
+
+      const hasSession = await waitForActiveSession(workoutClassId, startQueue);
+      if (!hasSession) {
+        console.warn(
+          `[RecordingWorker] No active ${joinAs} session for class ${workoutClassId} — was the worker running for the full class?`,
+        );
+        await sessionManager.notifySessionMissing(workoutClassId, queueRole);
+        return;
+      }
+
+      stopJobsInFlight.add(workoutClassId);
+      try {
+        await sessionManager.stopClassRecording(workoutClassId);
+      } catch (err) {
+        console.error(
+          `[RecordingWorker] Stop processing failed for class ${workoutClassId}:`,
+          err instanceof Error ? err.message : err,
+        );
+        await sessionManager.forceCloseSession(workoutClassId);
+        throw err;
+      } finally {
+        stopJobsInFlight.delete(workoutClassId);
+      }
+    },
+    STOP_WORKER_OPTS,
+  );
+
+  workers.push(startWorker, stopWorker);
+
+  startWorker.on('error', (err) => {
+    console.error(`[RecordingWorker] Start worker error (${queueRole}):`, err);
+  });
+  startWorker.on('stalled', (jobId) => {
+    console.warn(`[RecordingWorker] Start worker stalled job ${jobId} (${queueRole})`);
+  });
+  startWorker.on('failed', (job, err) => {
+    console.error(
+      `[RecordingWorker] Start worker failed job ${job?.id} (${queueRole}):`,
+      err,
     );
+  });
+  startWorker.on('completed', (job) => {
+    console.log(`[RecordingWorker] Start worker completed job ${job.id} (${queueRole})`);
+  });
 
-    const hasSession = await waitForActiveSession(workoutClassId);
-    if (!hasSession) {
-      console.warn(
-        `[RecordingWorker] No active ${joinAs} session for class ${workoutClassId} — was the worker running for the full class?`,
-      );
-      await sessionManager.notifySessionMissing(workoutClassId);
-      return;
-    }
+  stopWorker.on('error', (err) => {
+    console.error(`[RecordingWorker] Stop worker error (${queueRole}):`, err);
+  });
+  stopWorker.on('stalled', (jobId) => {
+    console.warn(`[RecordingWorker] Stop worker stalled job ${jobId} (${queueRole})`);
+  });
+  stopWorker.on('failed', (job, err) => {
+    console.error(
+      `[RecordingWorker] Stop worker failed job ${job?.id} (${queueRole}):`,
+      err,
+    );
+  });
+  stopWorker.on('completed', (job) => {
+    console.log(`[RecordingWorker] Stop worker completed job ${job.id} (${queueRole})`);
+  });
 
-    try {
-      await sessionManager.stopClassRecording(workoutClassId);
-    } catch (err) {
-      console.error(
-        `[RecordingWorker] Stop processing failed for class ${workoutClassId}:`,
-        err instanceof Error ? err.message : err,
-      );
-      await sessionManager.forceCloseSession(workoutClassId);
-      throw err;
-    }
-  },
-  STOP_WORKER_OPTS,
-);
+  startWorker.on('ready', () =>
+    console.log(`[RecordingWorker][redis] start worker ready (${queueRole})`),
+  );
+  stopWorker.on('ready', () =>
+    console.log(`[RecordingWorker][redis] stop worker ready (${queueRole})`),
+  );
 
-startWorker.on('error', (err) => {
-  console.error('[RecordingWorker] Start worker error:', err);
-});
-startWorker.on('stalled', (jobId) => {
-  console.warn(`[RecordingWorker] Start worker stalled job ${jobId}`);
-});
-startWorker.on('failed', (job, err) => {
-  console.error(`[RecordingWorker] Start worker failed job ${job?.id}:`, err);
-});
-startWorker.on('completed', (job) => {
-  console.log(`[RecordingWorker] Start worker completed job ${job.id}`);
-});
-
-stopWorker.on('error', (err) => {
-  console.error('[RecordingWorker] Stop worker error:', err);
-});
-stopWorker.on('stalled', (jobId) => {
-  console.warn(`[RecordingWorker] Stop worker stalled job ${jobId}`);
-});
-stopWorker.on('failed', (job, err) => {
-  console.error(`[RecordingWorker] Stop worker failed job ${job?.id}:`, err);
-});
-stopWorker.on('completed', (job) => {
-  console.log(`[RecordingWorker] Stop worker completed job ${job.id}`);
-});
+  void attachRedisConnectionLogging(`start-queue-${queueRole}`, startQueue.client);
+  void attachRedisConnectionLogging(`stop-queue-${queueRole}`, stopQueue.client);
+  void attachRedisConnectionLogging(`start-worker-${queueRole}`, startWorker.client);
+  void attachRedisConnectionLogging(`stop-worker-${queueRole}`, stopWorker.client);
+}
 
 // ── Redis connection lifecycle logging ────────────────────────────────────────
 // Surfaces the underlying ioredis connection state so a Redis failover is
@@ -270,21 +336,6 @@ async function attachRedisConnectionLogging(
   }
 }
 
-// The blocking connection (used by bzpopmin to fetch jobs) is the one demoted
-// on a failover; BullMQ re-emits 'ready' once it has reconnected to the new
-// primary and can pull jobs again.
-startWorker.on('ready', () =>
-  console.log('[RecordingWorker][redis] start worker ready to fetch jobs'),
-);
-stopWorker.on('ready', () =>
-  console.log('[RecordingWorker][redis] stop worker ready to fetch jobs'),
-);
-
-void attachRedisConnectionLogging('start-queue', startQueue.client);
-void attachRedisConnectionLogging('stop-queue', stopQueue.client);
-void attachRedisConnectionLogging('start-worker', startWorker.client);
-void attachRedisConnectionLogging('stop-worker', stopWorker.client);
-
 console.log(
-  `[RecordingWorker] Listening on ${startQueueName} and ${stopQueueName}`,
+  `[RecordingWorker] Listening on ${queueRoles.length} start/stop queue pair(s)`,
 );
