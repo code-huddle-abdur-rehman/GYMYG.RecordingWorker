@@ -22,10 +22,12 @@ npm run dev
 | `WORKOUT_PATH` | Path to workout page (default `/workout`) |
 | `BUCKET_NAME` | S3 bucket for uploads |
 | `CLASS_RECORDING_PREFIX` | S3 key prefix (default `classRecordings`) |
+| `JOIN_AS` | Which perspective to record: `client`, `trainer`, `coach`, or `all` (all three in one process) |
 | `EMAIL` / `PASSWORD` | Dedicated **client** account for the client recording bot |
+
 | `CORPORATE_EMAIL` / `CORPORATE_PASSWORD` | **Admin** account for corporate trainer/coach mirror bots |
 
-## Queues
+Set `JOIN_AS=all` to run a single worker that records client, trainer, and coach perspectives together (~2GB+ RAM per active class). Otherwise deploy one worker per perspective (`client`, `trainer`, `coach`).
 
 - `class-recording-start` — opens up to **three** Playwright contexts per class:
   - **Client** — joins immediately via recording bot token
