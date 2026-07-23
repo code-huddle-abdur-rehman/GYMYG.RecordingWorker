@@ -123,12 +123,27 @@ async function waitForActiveSession(
 
 console.log('[RecordingWorker] Starting workers...');
 
+// How long the BullMQ lock is held before it must be renewed.  This must
+// comfortably exceed the worst-case start-job duration so the lock never
+// expires while the processor is still running.
+//
+// Worst-case timeline:
+//   navigate + waitForSessionJoined (attempt 1) : SESSION_JOIN_TIMEOUT_MS = 180 s
+//   retry delay                                 :                           5 s
+//   navigate + waitForSessionJoined (attempt 2) : SESSION_JOIN_TIMEOUT_MS = 180 s
+//   ─────────────────────────────────────────────────────────────────────────────
+//   total                                       :                         ≈ 365 s
+//
+// With lockDuration = 900 s the automatic renewal fires at ~450 s — well after
+// the job is done in the typical case.  The per-job heartbeat below (every 60 s)
+// provides a second layer of protection when the host is under heavy load
+// (e.g. a parallel special-event Chromium + ffmpeg stop running at the same time).
+const START_LOCK_DURATION = 900_000;
+
 const START_WORKER_OPTS = {
   connection,
   concurrency: 1,
-  // Start jobs can involve browser launch/login and may run for minutes.
-  // Keep a generous lock to reduce false stalls during transient Redis jitter.
-  lockDuration: 300_000,
+  lockDuration: START_LOCK_DURATION,
   stalledInterval: 60_000,
   maxStalledCount: 2,
 };
@@ -152,7 +167,7 @@ for (const queueRole of queueRoles) {
 
   const startWorker = new Worker(
     startQueueName,
-    async (job) => {
+    async (job, token) => {
       const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
 
       if (sessionManager.hasSession(workoutClassId)) {
@@ -176,6 +191,22 @@ for (const queueRole of queueRoles) {
       );
       const startPromise = sessionManager.startClassRecording(workoutClassId);
       startJobsInFlight.set(workoutClassId, startPromise);
+
+      // Heartbeat: extend the lock every 60 s so a slow join (Chromium launch,
+      // Daily.co WebRTC negotiation) under host load never lets the lock expire
+      // between the automatic LockManager renewal ticks.  This is especially
+      // important when a parallel special-event stop (ffmpeg + S3) is competing
+      // for CPU/memory on the same host.
+      const lockHeartbeat = setInterval(() => {
+        if (!token) return;
+        job.extendLock(token, START_LOCK_DURATION).catch((err: unknown) => {
+          console.warn(
+            `[RecordingWorker] Failed to extend start lock for class ${workoutClassId}:`,
+            err instanceof Error ? err.message : err,
+          );
+        });
+      }, 60_000);
+
       try {
         await startPromise;
         console.log(
@@ -189,6 +220,7 @@ for (const queueRole of queueRoles) {
         await sessionManager.forceCloseSession(workoutClassId);
         throw err;
       } finally {
+        clearInterval(lockHeartbeat);
         startJobsInFlight.delete(workoutClassId);
       }
     },
