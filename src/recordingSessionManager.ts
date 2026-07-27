@@ -71,7 +71,10 @@ interface LoginResponse {
 
 const STAFF_WAIT_TIMEOUT_MS = 300_000;
 const STAFF_POLL_INTERVAL_MS = 5_000;
-const SESSION_JOIN_TIMEOUT_MS = 300_000;
+// Reduced from 300 s to 180 s so each join attempt fails fast under host load,
+// keeping the total worst-case start-job duration (2 attempts + retry delay) at
+// ~365 s — safely within the 900 s start lockDuration set in index.ts.
+const SESSION_JOIN_TIMEOUT_MS = 180_000;
 const RECORDING_JOIN_ATTEMPTS = 2;
 const RECORDING_JOIN_RETRY_DELAY_MS = 5_000;
 // Stopping the in-page MediaRecorder and pulling the captured audio back out as
