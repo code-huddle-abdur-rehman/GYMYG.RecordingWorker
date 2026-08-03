@@ -1130,12 +1130,16 @@ export class RecordingSessionManager {
     // that could exceed STOP_AUDIO_COLLECT_TIMEOUT_MS on loaded hosts.
     const audioFilePath = path.join(videoDir, `audio-${uuidv4()}.webm`);
     const audioStream = createWriteStream(audioFilePath, { flags: 'a' });
-    audioStream.on('error', (err) =>
+    // Track stream errors so they can be surfaced to the page caller, which
+    // lets the page-side retry mechanism decide whether to retry or give up.
+    let audioStreamError: Error | null = null;
+    audioStream.on('error', (err) => {
+      audioStreamError = err;
       console.error(
         `[RecordingWorker] Audio stream error for class ${workoutClassId} (${perspective}):`,
         err,
-      ),
-    );
+      );
+    });
     let totalAudioBytes = 0;
     let audioStreamClosed = false;
     const audioStreamDone = new Promise<void>((resolve) => {
@@ -1145,9 +1149,24 @@ export class RecordingSessionManager {
 
     await context.exposeFunction('__saveAudioChunk', async (b64: string) => {
       if (!b64 || audioStreamClosed) return;
+      // Propagate any prior stream error back to the page so the retry loop
+      // on the page side can act on it rather than silently dropping the chunk.
+      if (audioStreamError) throw audioStreamError;
       const chunk = Buffer.from(b64, 'base64');
+      // Write with a callback so write errors are returned as a rejection to
+      // the page caller.  Backpressure is signalled by write() returning false;
+      // the callback still fires once the buffer drains, so awaiting it is
+      // sufficient to honour backpressure without a separate drain listener.
+      await new Promise<void>((resolve, reject) => {
+        const ok = audioStream.write(chunk, (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+        if (!ok) {
+          // Backpressure detected — resolution happens via the callback above.
+        }
+      });
       totalAudioBytes += chunk.byteLength;
-      audioStream.write(chunk);
     });
 
     await context.exposeFunction('__finishAudioRecording', async () => {
