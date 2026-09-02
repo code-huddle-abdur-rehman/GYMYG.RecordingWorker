@@ -86,6 +86,31 @@ const RECORDING_JOIN_RETRY_DELAY_MS = 5_000;
 const STOP_AUDIO_COLLECT_TIMEOUT_MS = 60_000;
 const STOP_PAGE_OP_TIMEOUT_MS = 30_000;
 const STOP_CONTEXT_CLOSE_TIMEOUT_MS = 60_000;
+// Budget for the audio write stream to flush its buffered chunks to disk once
+// end() has been called. This MUST be bounded: an unbounded wait here blocks
+// closeRecordingContext, which blocks stopClassRecording before it reaches the
+// finally that closes Chromium. Since the stop worker runs at concurrency 1,
+// one such hang permanently occupies the only stop slot, so every subsequent
+// class leaks a live Chromium (still in the WebRTC call, still encoding) until
+// the process is restarted.
+const STOP_AUDIO_STREAM_DRAIN_TIMEOUT_MS = 30_000;
+// Outer guard for the whole flush (in-page collect + stream drain), set above
+// the sum of its two internal budgets so it only fires if something new inside
+// flushAudio blocks unexpectedly.
+const STOP_AUDIO_FLUSH_TIMEOUT_MS =
+  STOP_AUDIO_COLLECT_TIMEOUT_MS + STOP_AUDIO_STREAM_DRAIN_TIMEOUT_MS + 30_000;
+// Cap on waiting for the corporate watcher loops to settle during a stop. The
+// loops exit within one STAFF_POLL_INTERVAL_MS tick of stoppingClassIds being
+// set; the extra headroom covers a loop caught mid-join.
+const STOP_CORPORATE_SETTLE_TIMEOUT_MS = 60_000;
+// Absolute wall-clock cap on a registered session, enforced from the moment it
+// is registered. The only other thing that closes a browser is an inbound stop
+// job, so a dropped/lost/never-enqueued stop job would otherwise leave a fully
+// recording Chromium alive forever. Deliberately anchored to elapsed time
+// rather than the class's own startsAt/duration: those are opaque pass-through
+// values here (the server decides their unit), and a mis-parsed unit could
+// abort a live recording, whereas a generous fixed cap cannot.
+const SESSION_MAX_LIFETIME_MS = Number(process.env.RECORDING_SESSION_MAX_LIFETIME_MS ?? 4 * 60 * 60 * 1000);
 
 function getRecordingResolution(): { width: number; height: number } {
   const raw = process.env.RECORDING_RESOLUTION ?? '960x540';
@@ -220,6 +245,7 @@ export class RecordingSessionManager {
 
   private activeSessions = new Map<number, ActiveSession>();
   private stoppingClassIds = new Set<number>();
+  private sessionWatchdogs = new Map<number, ReturnType<typeof setTimeout>>();
   private s3 = new S3Client({
     region: process.env.AWS_REGION || 'us-east-1',
     followRegionRedirects: true,
@@ -450,6 +476,7 @@ export class RecordingSessionManager {
       }
 
       this.activeSessions.set(workoutClassId, session);
+      this.armSessionWatchdog(workoutClassId);
       browser = null;
 
       console.log(
@@ -458,8 +485,9 @@ export class RecordingSessionManager {
     } catch (err) {
       await this.closeEntries(entries);
       if (browser) {
-        await browser.close().catch(() => undefined);
+        await this.closeBrowserHard(browser, `class ${workoutClassId} (start failed)`);
       }
+      this.clearSessionWatchdog(workoutClassId);
       this.activeSessions.delete(workoutClassId);
       throw err;
     }
@@ -610,7 +638,18 @@ export class RecordingSessionManager {
     console.log(
       `[RecordingWorker] Flushing ${perspective} audio stream for class ${workoutClassId}...`,
     );
-    await entry.flushAudio();
+    // flushAudio is internally bounded, but keep an outer guard so this call
+    // site can never become the one unbounded await in the stop path again.
+    await withTimeout(
+      entry.flushAudio(),
+      STOP_AUDIO_FLUSH_TIMEOUT_MS,
+      `${perspective} audio flush (outer) for class ${workoutClassId}`,
+    ).catch((err) => {
+      console.warn(
+        `[RecordingWorker] Audio flush exceeded its outer budget for ${perspective} class ${workoutClassId}, continuing:`,
+        err instanceof Error ? err.message : err,
+      );
+    });
 
     const audioStartMs = !pageClosed
       ? await page
@@ -720,15 +759,25 @@ export class RecordingSessionManager {
     }
 
     this.stoppingClassIds.add(workoutClassId);
+    this.clearSessionWatchdog(workoutClassId);
 
     if (this.recordsCorporate()) {
       console.log(
         `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
       );
-      await session.corporateSetupPromise.catch((err) => {
+      // Bounded: the watcher loop honours stoppingClassIds within one poll
+      // tick, but if it is mid-openPerspective (untimed newContext /
+      // addInitScript / exposeFunction calls against a wedged browser) this
+      // promise may never settle — which would strand the stop before the
+      // finally that closes Chromium, on a concurrency-1 worker.
+      await withTimeout(
+        session.corporateSetupPromise,
+        STOP_CORPORATE_SETTLE_TIMEOUT_MS,
+        `corporate setup settle for class ${workoutClassId}`,
+      ).catch((err) => {
         console.warn(
-          `[RecordingWorker] Corporate setup ended with error for class ${workoutClassId}:`,
-          err,
+          `[RecordingWorker] Corporate setup ended with error / did not settle for class ${workoutClassId}:`,
+          err instanceof Error ? err.message : err,
         );
       });
     }
@@ -787,16 +836,7 @@ export class RecordingSessionManager {
         }
       }
     } finally {
-      await withTimeout(
-        session.browser.close(),
-        STOP_CONTEXT_CLOSE_TIMEOUT_MS,
-        `browser close for class ${workoutClassId}`,
-      ).catch((err) => {
-        console.error(
-          `[RecordingWorker] Failed to close browser for class ${workoutClassId}:`,
-          err,
-        );
-      });
+      await this.closeBrowserHard(session.browser, `class ${workoutClassId}`);
       console.log(`[RecordingWorker] Browser closed for class ${workoutClassId}`);
       await fs
         .rm(path.join(getRecordingTmpDir(), String(workoutClassId)), {
@@ -827,12 +867,86 @@ export class RecordingSessionManager {
       return;
     }
     this.stoppingClassIds.add(workoutClassId);
+    this.clearSessionWatchdog(workoutClassId);
     this.activeSessions.delete(workoutClassId);
-    await session.corporateSetupPromise.catch(() => undefined);
+    // Bounded so this path (used by the watchdog and by shutdown) always
+    // reaches the browser close below.
+    await withTimeout(
+      session.corporateSetupPromise,
+      STOP_CORPORATE_SETTLE_TIMEOUT_MS,
+      `corporate setup settle for class ${workoutClassId} (force)`,
+    ).catch(() => undefined);
     this.stoppingClassIds.delete(workoutClassId);
     await this.closeEntries(session.entries);
-    await session.browser.close().catch(() => undefined);
+    await this.closeBrowserHard(session.browser, `class ${workoutClassId} (force)`);
     console.log(`[RecordingWorker] Force-closed browser for class ${workoutClassId}`);
+  }
+
+  /**
+   * Arms the safety net for a freshly registered session.
+   *
+   * An inbound stop job is otherwise the *only* thing that closes a browser, so
+   * any lost stop job (API-side failure, Redis eviction, an API deploy mid
+   * class, or a wedged stop worker) leaves a fully recording Chromium alive
+   * indefinitely. This guarantees every session is eventually reclaimed.
+   */
+  private armSessionWatchdog(workoutClassId: number): void {
+    this.clearSessionWatchdog(workoutClassId);
+
+    const timer = setTimeout(() => {
+      this.sessionWatchdogs.delete(workoutClassId);
+      if (!this.activeSessions.has(workoutClassId)) return;
+      console.error(
+        `[RecordingWorker] Watchdog: class ${workoutClassId} still active after ` +
+          `${Math.round(SESSION_MAX_LIFETIME_MS / 60_000)} min with no stop job — force-closing to reclaim resources`,
+      );
+      void this.forceCloseSession(workoutClassId).catch((err) =>
+        console.error(
+          `[RecordingWorker] Watchdog force-close failed for class ${workoutClassId}:`,
+          err,
+        ),
+      );
+    }, SESSION_MAX_LIFETIME_MS);
+
+    // Never let a pending watchdog be the reason the process stays alive.
+    timer.unref?.();
+    this.sessionWatchdogs.set(workoutClassId, timer);
+  }
+
+  private clearSessionWatchdog(workoutClassId: number): void {
+    const timer = this.sessionWatchdogs.get(workoutClassId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.sessionWatchdogs.delete(workoutClassId);
+  }
+
+  /**
+   * Single bounded path for closing a session browser.
+   *
+   * Every close site must be time-boxed: an unbounded browser.close() against
+   * a wedged Chromium blocks the caller, and on the concurrency-1 stop worker
+   * that strands the only stop slot, so every later class leaks a live
+   * Chromium (still in the WebRTC call, still encoding) until restart.
+   *
+   * Known gap: if close() times out, the OS process may survive and this
+   * process cannot reap it — chromium.launch() gives no public handle on the
+   * browser's ChildProcess (Playwright exposes process() only on
+   * BrowserServer/ElectronApplication). A true hard-kill needs either
+   * launchServer() + connect() (which changes how recordVideo artifacts are
+   * resolved) or an out-of-band pid reaper. The timeout below at least keeps
+   * the worker itself alive and loudly flags the orphan.
+   */
+  private async closeBrowserHard(browser: Browser, label: string): Promise<void> {
+    await withTimeout(
+      browser.close(),
+      STOP_CONTEXT_CLOSE_TIMEOUT_MS,
+      `browser close for ${label}`,
+    ).catch((err) => {
+      console.error(
+        `[RecordingWorker] Browser close failed/timed out for ${label} — a Chromium process may now be orphaned:`,
+        err instanceof Error ? err.message : err,
+      );
+    });
   }
 
   private async closeEntries(entries: ActiveSession['entries']): Promise<void> {
@@ -1145,7 +1259,19 @@ export class RecordingSessionManager {
     const audioStreamDone = new Promise<void>((resolve) => {
       audioStream.on('finish', resolve);
       audioStream.on('error', () => resolve());
+      // destroy() (see destroyAudio) emits 'close' but never 'finish', so
+      // without this listener the promise would be permanently unresolvable
+      // after a destroy.
+      audioStream.on('close', () => resolve());
     });
+
+    // Idempotent: safe to call from both the page-driven hook and the
+    // worker-side flush, whichever gets there first.
+    const endAudioStream = () => {
+      if (audioStreamClosed) return;
+      audioStreamClosed = true;
+      audioStream.end();
+    };
 
     await context.exposeFunction('__saveAudioChunk', async (b64: string) => {
       if (!b64 || audioStreamClosed) return;
@@ -1170,10 +1296,7 @@ export class RecordingSessionManager {
     });
 
     await context.exposeFunction('__finishAudioRecording', async () => {
-      if (!audioStreamClosed) {
-        audioStreamClosed = true;
-        audioStream.end();
-      }
+      endAudioStream();
       await audioStreamDone;
       console.log(
         `[RecordingWorker] Audio stream closed for class ${workoutClassId} (${perspective}) — ` +
@@ -1199,11 +1322,27 @@ export class RecordingSessionManager {
             err,
           ),
         );
-      } else if (!audioStreamClosed) {
-        audioStreamClosed = true;
-        audioStream.end();
       }
-      await audioStreamDone;
+
+      // Always end the stream from the worker side, even when the page is still
+      // open. Normally the in-page hook ends it via __finishAudioRecording, but
+      // if that evaluate timed out, threw, or the hook was never installed (the
+      // page never reached the joined state), nothing would ever call end() —
+      // and the wait below would never settle.
+      endAudioStream();
+
+      await withTimeout(
+        audioStreamDone,
+        STOP_AUDIO_STREAM_DRAIN_TIMEOUT_MS,
+        `${perspective} audio stream drain for class ${workoutClassId}`,
+      ).catch((err) => {
+        // Give up rather than block: a truncated audio file still muxes, and
+        // proceeding is strictly better than wedging the stop worker.
+        console.warn(
+          `[RecordingWorker] Audio stream did not drain for ${perspective} class ${workoutClassId}, continuing:`,
+          err instanceof Error ? err.message : err,
+        );
+      });
     };
 
     const destroyAudio = () => {
