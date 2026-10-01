@@ -24,8 +24,10 @@ npm run dev
 | `CLASS_RECORDING_PREFIX` | S3 key prefix (default `classRecordings`) |
 | `JOIN_AS` | Which perspective to record: `client`, `trainer`, `coach`, or `all` (all three in one process) |
 | `EMAIL` / `PASSWORD` | Dedicated **client** account for the client recording bot |
-
 | `CORPORATE_EMAIL` / `CORPORATE_PASSWORD` | **Admin** account for corporate trainer/coach mirror bots |
+| `RECORDING_IDLE_TIMEOUT_MS` | Stop, upload and leave once no real user (bots and live-view admins excluded) has been in the call this long (default `600000`, 10 min). `0` disables it |
+| `RECORDING_IDLE_REPORT_STALE_MS` | A bot page silent for longer than this counts as "state unknown", never idle (default `60000`) |
+| `RECORDING_SESSION_MAX_LIFETIME_MS` | Watchdog: stop and upload a session still running after this long with no stop job (default `14400000`, 4 h) |
 
 Set `JOIN_AS=all` to run a single worker that records client, trainer, and coach perspectives together (~2GB+ RAM per active class). Otherwise deploy one worker per perspective (`client`, `trainer`, `coach`).
 

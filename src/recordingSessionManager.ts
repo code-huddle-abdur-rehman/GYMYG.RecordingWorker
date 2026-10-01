@@ -18,6 +18,7 @@ import type { JoinAsMode } from './queues.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
 type StaffRole = 'trainer' | 'coach';
+export type StopReason = 'job' | 'idle' | 'watchdog';
 
 interface JoinDetails {
   roomToken: string;
@@ -36,6 +37,8 @@ interface StaffPresence {
   leadTrainerUserId: string | null;
   assignedCoachUserId: string | null;
   participantUserIds?: string[];
+  // Only returned when requested; absent on servers that predate idle exit.
+  realParticipantCount?: number;
 }
 
 interface RecordingEntry {
@@ -45,6 +48,7 @@ interface RecordingEntry {
   videoRecordingStartMs: number;
   diagnostics: PageDiagnostics;
   audioFilePath: string;
+  presenceReporterId: string;
   flushAudio: () => Promise<void>;
   destroyAudio: () => void;
 }
@@ -53,6 +57,16 @@ interface ActiveSession {
   entries: RecordingEntry[];
   browser: Browser;
   corporateSetupPromise: Promise<void>;
+  // Segments closed mid-class (a trainer/coach left), uploading in the
+  // background. Stop waits for them before its own uploads and cleanup.
+  segmentFinalizations: Promise<void>[];
+  // Per perspective: whether any mid-class segment uploaded successfully.
+  segmentResults: Map<Perspective, boolean>;
+}
+
+interface PresenceReport {
+  count: number;
+  at: number;
 }
 
 interface AuthSession {
@@ -111,6 +125,17 @@ const STOP_CORPORATE_SETTLE_TIMEOUT_MS = 60_000;
 // values here (the server decides their unit), and a mis-parsed unit could
 // abort a live recording, whereas a generous fixed cap cannot.
 const SESSION_MAX_LIFETIME_MS = Number(process.env.RECORDING_SESSION_MAX_LIFETIME_MS ?? 4 * 60 * 60 * 1000);
+// Bots are billed Daily participants, so once no real user has been in the call
+// for this long the session stops, uploads and leaves. 0 disables the feature.
+const IDLE_TIMEOUT_MS = Number(process.env.RECORDING_IDLE_TIMEOUT_MS ?? 10 * 60 * 1000);
+// The page re-reports its count every 30 s. A page silent for longer than this
+// (crashed, frozen) means the room state is unknown, which never counts as idle;
+// the session watchdog covers dead pages instead.
+const IDLE_REPORT_STALE_MS = Number(process.env.RECORDING_IDLE_REPORT_STALE_MS ?? 60_000);
+// How long to remember a class this worker stopped by itself (idle / watchdog),
+// so the server's delayed auto-stop that arrives later is treated as a no-op
+// instead of being reported as a missing session.
+const SELF_STOPPED_TTL_MS = 6 * 60 * 60 * 1000;
 
 function getRecordingResolution(): { width: number; height: number } {
   const raw = process.env.RECORDING_RESOLUTION ?? '960x540';
@@ -246,6 +271,15 @@ export class RecordingSessionManager {
   private activeSessions = new Map<number, ActiveSession>();
   private stoppingClassIds = new Set<number>();
   private sessionWatchdogs = new Map<number, ReturnType<typeof setTimeout>>();
+  // Idle exit: latest real-user count reported by each bot page, per class.
+  private presenceReports = new Map<number, Map<string, PresenceReport>>();
+  private idleTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  // Classes whose idle stop job is queued but not yet processed. A real user
+  // joining in the meantime removes the class, which cancels that job.
+  private idleStopRequested = new Set<number>();
+  // classId → expiry time (ms).
+  private selfStoppedClassIds = new Map<number, number>();
+  private idleStopHandler: ((workoutClassId: number) => Promise<void>) | null = null;
   private s3 = new S3Client({
     region: process.env.AWS_REGION || 'us-east-1',
     followRegionRedirects: true,
@@ -461,6 +495,8 @@ export class RecordingSessionManager {
         browser,
         entries,
         corporateSetupPromise: Promise.resolve(),
+        segmentFinalizations: [],
+        segmentResults: new Map(),
       };
 
       if (this.recordsCorporate()) {
@@ -482,12 +518,16 @@ export class RecordingSessionManager {
       console.log(
         `[RecordingWorker] ${this.joinAs} session registered for class ${workoutClassId}`,
       );
+      // The client bot may already have reported an empty room while joining,
+      // before the session existed to arm a timer for.
+      this.evaluateIdleState(workoutClassId);
     } catch (err) {
       await this.closeEntries(entries);
       if (browser) {
         await this.closeBrowserHard(browser, `class ${workoutClassId} (start failed)`);
       }
       this.clearSessionWatchdog(workoutClassId);
+      this.clearIdleTracking(workoutClassId);
       this.activeSessions.delete(workoutClassId);
       throw err;
     }
@@ -499,6 +539,9 @@ export class RecordingSessionManager {
     joinAs: 'trainer' | 'coach',
   ): Promise<void> {
     let corporateAuthSession: AuthSession | null = null;
+    // The mirror bot for the staff member's current stay in the call, closed
+    // when they leave so it is not left recording (and billed) on its own.
+    let currentEntry: RecordingEntry | null = null;
 
     const openPerspective = async (
       perspective: 'trainer' | 'coach',
@@ -516,6 +559,7 @@ export class RecordingSessionManager {
         corporateAuthSession,
       );
       session.entries.push(entry);
+      currentEntry = entry;
       console.log(
         `[RecordingWorker] ${perspective} corporate browser session open for class ${workoutClassId}`,
       );
@@ -563,8 +607,9 @@ export class RecordingSessionManager {
 
     // ── Re-join watcher ───────────────────────────────────────────────────
     // Keeps running until stopClassRecording signals via stoppingClassIds.
-    // When the staff member leaves and rejoins, a fresh recording context is
-    // opened and appended to session.entries so it gets uploaded on stop.
+    // When the staff member leaves, their mirror bot is closed and its segment
+    // uploaded in the background. When they rejoin, a fresh recording context
+    // is opened and appended to session.entries so it gets uploaded on stop.
     while (!this.stoppingClassIds.has(workoutClassId)) {
       await new Promise<void>((resolve) =>
         setTimeout(resolve, STAFF_POLL_INTERVAL_MS),
@@ -575,6 +620,14 @@ export class RecordingSessionManager {
         const presence = await this.fetchStaffPresence(workoutClassId);
         const isInCall =
           joinAs === 'trainer' ? presence.trainerInCall : presence.coachInCall;
+
+        if (!isInCall && wasInCall && currentEntry) {
+          console.log(
+            `[RecordingWorker] ${joinAs} left class ${workoutClassId} — closing their mirror bot and uploading its segment`,
+          );
+          this.finalizeDetachedSegment(workoutClassId, session, currentEntry);
+          currentEntry = null;
+        }
 
         if (isInCall && !wasInCall) {
           const liveViewRole =
@@ -751,15 +804,77 @@ export class RecordingSessionManager {
     }
   }
 
-  async stopClassRecording(workoutClassId: number): Promise<void> {
+  /**
+   * Closes a mirror bot whose staff member left the call, uploading its
+   * segment in the background so the watcher loop keeps polling for a rejoin.
+   */
+  private finalizeDetachedSegment(
+    workoutClassId: number,
+    session: ActiveSession,
+    entry: RecordingEntry,
+  ): void {
+    const index = session.entries.indexOf(entry);
+    if (index !== -1) session.entries.splice(index, 1);
+    this.removePresenceReport(workoutClassId, entry.presenceReporterId);
+
+    const work = (async () => {
+      let succeeded = false;
+      try {
+        const { videoPath, audioFilePath, audioStartMs, screenshot } =
+          await this.closeRecordingContext(entry, workoutClassId);
+        if (videoPath) {
+          await this.finalizeRecordingEntry(
+            workoutClassId,
+            entry,
+            videoPath,
+            audioFilePath,
+            audioStartMs,
+            screenshot,
+          );
+          succeeded = true;
+        }
+      } catch (err) {
+        console.error(
+          `[RecordingWorker] Error finalizing departed ${entry.perspective} segment for class ${workoutClassId}:`,
+          err,
+        );
+        await entry.diagnostics.dispose().catch(() => undefined);
+        await entry.context.close().catch(() => undefined);
+      }
+      session.segmentResults.set(
+        entry.perspective,
+        succeeded || session.segmentResults.get(entry.perspective) === true,
+      );
+    })();
+    session.segmentFinalizations.push(work);
+  }
+
+  async stopClassRecording(
+    workoutClassId: number,
+    reason: StopReason = 'job',
+  ): Promise<void> {
     const session = this.activeSessions.get(workoutClassId);
     if (!session) {
       console.log(`[RecordingWorker] No active session for class ${workoutClassId}`);
       return;
     }
+    // A stop job and a watchdog stop can overlap; only the first may proceed.
+    if (this.stoppingClassIds.has(workoutClassId)) {
+      console.log(
+        `[RecordingWorker] Stop already in progress for class ${workoutClassId} — ignoring ${reason} stop`,
+      );
+      return;
+    }
 
+    console.log(
+      `[RecordingWorker] Stopping class ${workoutClassId} (reason: ${reason})`,
+    );
     this.stoppingClassIds.add(workoutClassId);
     this.clearSessionWatchdog(workoutClassId);
+    this.clearIdleTracking(workoutClassId);
+    if (reason !== 'job') {
+      this.markSelfStopped(workoutClassId);
+    }
 
     if (this.recordsCorporate()) {
       console.log(
@@ -798,6 +913,20 @@ export class RecordingSessionManager {
       // only report "failed" for perspectives where every segment failed.
       const succeededPerspectives = new Set<Perspective>();
       const attemptedPerspectives = new Set<Perspective>();
+
+      // Segments closed mid-class upload first, so the live segment's upload
+      // below is the one the server keeps. They must also finish before the
+      // finally removes this class's temp directory.
+      if (session.segmentFinalizations.length > 0) {
+        console.log(
+          `[RecordingWorker] Waiting for ${session.segmentFinalizations.length} departed segment upload(s) for class ${workoutClassId}`,
+        );
+        await Promise.allSettled(session.segmentFinalizations);
+      }
+      for (const [perspective, succeeded] of session.segmentResults) {
+        attemptedPerspectives.add(perspective);
+        if (succeeded) succeededPerspectives.add(perspective);
+      }
 
       for (const entry of entries) {
         attemptedPerspectives.add(entry.perspective);
@@ -868,9 +997,10 @@ export class RecordingSessionManager {
     }
     this.stoppingClassIds.add(workoutClassId);
     this.clearSessionWatchdog(workoutClassId);
+    this.clearIdleTracking(workoutClassId);
     this.activeSessions.delete(workoutClassId);
-    // Bounded so this path (used by the watchdog and by shutdown) always
-    // reaches the browser close below.
+    // Bounded so this path (used as the watchdog fallback and by shutdown)
+    // always reaches the browser close below.
     await withTimeout(
       session.corporateSetupPromise,
       STOP_CORPORATE_SETTLE_TIMEOUT_MS,
@@ -895,17 +1025,30 @@ export class RecordingSessionManager {
 
     const timer = setTimeout(() => {
       this.sessionWatchdogs.delete(workoutClassId);
-      if (!this.activeSessions.has(workoutClassId)) return;
+      if (
+        !this.activeSessions.has(workoutClassId) ||
+        this.stoppingClassIds.has(workoutClassId)
+      ) {
+        return;
+      }
       console.error(
         `[RecordingWorker] Watchdog: class ${workoutClassId} still active after ` +
-          `${Math.round(SESSION_MAX_LIFETIME_MS / 60_000)} min with no stop job — force-closing to reclaim resources`,
+          `${Math.round(SESSION_MAX_LIFETIME_MS / 60_000)} min with no stop job — stopping and uploading what was recorded`,
       );
-      void this.forceCloseSession(workoutClassId).catch((err) =>
+      // Normal stop first so the recording is uploaded and the server
+      // notified; every step in it is time-boxed. Force-close only if it fails.
+      void this.stopClassRecording(workoutClassId, 'watchdog').catch(async (err) => {
         console.error(
-          `[RecordingWorker] Watchdog force-close failed for class ${workoutClassId}:`,
+          `[RecordingWorker] Watchdog stop failed for class ${workoutClassId} — force-closing:`,
           err,
-        ),
-      );
+        );
+        await this.forceCloseSession(workoutClassId).catch((closeErr) =>
+          console.error(
+            `[RecordingWorker] Watchdog force-close failed for class ${workoutClassId}:`,
+            closeErr,
+          ),
+        );
+      });
     }, SESSION_MAX_LIFETIME_MS);
 
     // Never let a pending watchdog be the reason the process stays alive.
@@ -918,6 +1061,227 @@ export class RecordingSessionManager {
     if (!timer) return;
     clearTimeout(timer);
     this.sessionWatchdogs.delete(workoutClassId);
+  }
+
+  // ── Idle exit ───────────────────────────────────────────────────────────
+  // Each bot page reports how many real (non-bot, non-admin) users are in the
+  // call. When none has been present for IDLE_TIMEOUT_MS, the class is stopped
+  // through this worker's own stop queue, so the recording is still uploaded.
+
+  /** Wires the idle stop to the stop queue (owned by index.ts). */
+  setIdleStopHandler(handler: (workoutClassId: number) => Promise<void>): void {
+    this.idleStopHandler = handler;
+  }
+
+  /** False once a real user has returned after the idle stop was queued. */
+  isIdleStopStillWanted(workoutClassId: number): boolean {
+    return this.idleStopRequested.has(workoutClassId);
+  }
+
+  /** True if this worker stopped the class itself (idle or watchdog) recently. */
+  wasSelfStopped(workoutClassId: number): boolean {
+    const now = Date.now();
+    for (const [classId, expiresAt] of this.selfStoppedClassIds) {
+      if (expiresAt <= now) this.selfStoppedClassIds.delete(classId);
+    }
+    return this.selfStoppedClassIds.has(workoutClassId);
+  }
+
+  private markSelfStopped(workoutClassId: number): void {
+    this.selfStoppedClassIds.set(workoutClassId, Date.now() + SELF_STOPPED_TTL_MS);
+  }
+
+  private recordPresenceReport(
+    workoutClassId: number,
+    reporterId: string,
+    perspective: Perspective,
+    count: number,
+  ): void {
+    if (!Number.isFinite(count) || count < 0) return;
+    let reports = this.presenceReports.get(workoutClassId);
+    if (!reports) {
+      reports = new Map();
+      this.presenceReports.set(workoutClassId, reports);
+    }
+    const previous = reports.get(reporterId);
+    reports.set(reporterId, { count, at: Date.now() });
+    if (previous?.count !== count) {
+      console.log(
+        `[RecordingWorker] Idle: ${perspective} bot sees ${count} real user(s) in class ${workoutClassId}`,
+      );
+    }
+    this.evaluateIdleState(workoutClassId);
+  }
+
+  private removePresenceReport(workoutClassId: number, reporterId: string): void {
+    const reports = this.presenceReports.get(workoutClassId);
+    if (!reports) return;
+    reports.delete(reporterId);
+    if (reports.size === 0) this.presenceReports.delete(workoutClassId);
+  }
+
+  /**
+   * Highest real-user count among recent reports (several bots can watch the
+   * same call), or null when no page has reported recently (state unknown).
+   */
+  private getFreshRealCount(workoutClassId: number): number | null {
+    const reports = this.presenceReports.get(workoutClassId);
+    if (!reports) return null;
+    const cutoff = Date.now() - IDLE_REPORT_STALE_MS;
+    let highest: number | null = null;
+    for (const report of reports.values()) {
+      if (report.at >= cutoff) highest = Math.max(highest ?? 0, report.count);
+    }
+    return highest;
+  }
+
+  private evaluateIdleState(workoutClassId: number): void {
+    if (IDLE_TIMEOUT_MS <= 0) return;
+    if (
+      !this.activeSessions.has(workoutClassId) ||
+      this.stoppingClassIds.has(workoutClassId)
+    ) {
+      return;
+    }
+
+    const realCount = this.getFreshRealCount(workoutClassId);
+    if (realCount === null) return;
+
+    if (realCount > 0) {
+      if (this.idleStopRequested.delete(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Idle: real user returned to class ${workoutClassId} — cancelling queued idle stop`,
+        );
+      }
+      if (this.clearIdleTimer(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Idle: real user present in class ${workoutClassId} — idle timer reset`,
+        );
+      }
+      return;
+    }
+
+    if (
+      this.idleTimers.has(workoutClassId) ||
+      this.idleStopRequested.has(workoutClassId)
+    ) {
+      return;
+    }
+    this.armIdleTimer(workoutClassId);
+  }
+
+  private armIdleTimer(workoutClassId: number): void {
+    this.clearIdleTimer(workoutClassId);
+    console.log(
+      `[RecordingWorker] Idle: no real users in class ${workoutClassId} — ` +
+        `stopping in ${Math.round(IDLE_TIMEOUT_MS / 60_000)} min unless someone joins`,
+    );
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(workoutClassId);
+      void this.onIdleTimeout(workoutClassId).catch((err) =>
+        console.error(
+          `[RecordingWorker] Idle: timeout handling failed for class ${workoutClassId}:`,
+          err,
+        ),
+      );
+    }, IDLE_TIMEOUT_MS);
+    timer.unref?.();
+    this.idleTimers.set(workoutClassId, timer);
+  }
+
+  private clearIdleTimer(workoutClassId: number): boolean {
+    const timer = this.idleTimers.get(workoutClassId);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this.idleTimers.delete(workoutClassId);
+    return true;
+  }
+
+  private clearIdleTracking(workoutClassId: number): void {
+    this.clearIdleTimer(workoutClassId);
+    this.idleStopRequested.delete(workoutClassId);
+    this.presenceReports.delete(workoutClassId);
+  }
+
+  private isIdleCandidate(workoutClassId: number): boolean {
+    return (
+      this.activeSessions.has(workoutClassId) &&
+      !this.stoppingClassIds.has(workoutClassId) &&
+      !this.idleTimers.has(workoutClassId) &&
+      this.getFreshRealCount(workoutClassId) === 0
+    );
+  }
+
+  private async onIdleTimeout(workoutClassId: number): Promise<void> {
+    if (
+      !this.activeSessions.has(workoutClassId) ||
+      this.stoppingClassIds.has(workoutClassId)
+    ) {
+      return;
+    }
+    if (this.getFreshRealCount(workoutClassId) === null) {
+      console.warn(
+        `[RecordingWorker] Idle: timer fired for class ${workoutClassId} but no bot has reported in ` +
+          `${Math.round(IDLE_REPORT_STALE_MS / 1000)}s — state unknown, not stopping`,
+      );
+      return;
+    }
+    if (!this.isIdleCandidate(workoutClassId)) return;
+
+    // One server-side check before acting, so a stale page cannot end a live
+    // recording.
+    let serverRealCount: number | undefined;
+    try {
+      const presence = await this.fetchStaffPresence(workoutClassId, {
+        includeRealParticipantCount: true,
+      });
+      serverRealCount = presence.realParticipantCount;
+    } catch (err) {
+      console.warn(
+        `[RecordingWorker] Idle: could not confirm presence for class ${workoutClassId} — re-arming:`,
+        err instanceof Error ? err.message : err,
+      );
+      if (this.isIdleCandidate(workoutClassId)) this.armIdleTimer(workoutClassId);
+      return;
+    }
+
+    // State may have moved while the request was in flight.
+    if (!this.isIdleCandidate(workoutClassId)) return;
+
+    if (serverRealCount === undefined) {
+      console.warn(
+        `[RecordingWorker] Idle: server did not return a real participant count for class ${workoutClassId} — relying on page reports`,
+      );
+    } else if (serverRealCount > 0) {
+      console.warn(
+        `[RecordingWorker] Idle: pages report 0 real users in class ${workoutClassId} but the server sees ${serverRealCount} — re-arming`,
+      );
+      this.armIdleTimer(workoutClassId);
+      return;
+    }
+
+    if (!this.idleStopHandler) {
+      console.warn(
+        `[RecordingWorker] Idle: no stop handler registered — cannot stop class ${workoutClassId}`,
+      );
+      return;
+    }
+
+    console.log(
+      `[RecordingWorker] Idle: class ${workoutClassId} has had no real users for ` +
+        `${Math.round(IDLE_TIMEOUT_MS / 60_000)} min — queueing stop (reason: idle)`,
+    );
+    this.idleStopRequested.add(workoutClassId);
+    try {
+      await this.idleStopHandler(workoutClassId);
+    } catch (err) {
+      this.idleStopRequested.delete(workoutClassId);
+      console.error(
+        `[RecordingWorker] Idle: failed to queue stop for class ${workoutClassId} — re-arming:`,
+        err,
+      );
+      if (this.isIdleCandidate(workoutClassId)) this.armIdleTimer(workoutClassId);
+    }
   }
 
   /**
@@ -972,8 +1336,16 @@ export class RecordingSessionManager {
     return resp.json() as Promise<JoinDetails>;
   }
 
-  private async fetchStaffPresence(workoutClassId: number): Promise<StaffPresence> {
-    const url = `${this.apiBase}/class-recording/worker/staff-presence/${workoutClassId}`;
+  private async fetchStaffPresence(
+    workoutClassId: number,
+    options?: { includeRealParticipantCount?: boolean },
+  ): Promise<StaffPresence> {
+    // The real participant count costs the server a DB lookup, so it is only
+    // requested for the idle confirmation, not on every watcher poll.
+    const query = options?.includeRealParticipantCount
+      ? '?includeRealParticipantCount=true'
+      : '';
+    const url = `${this.apiBase}/class-recording/worker/staff-presence/${workoutClassId}${query}`;
     const resp = await fetch(url, {
       headers: { 'x-recording-worker-key': this.workerKey },
     });
@@ -1139,6 +1511,7 @@ export class RecordingSessionManager {
     diagnostics: PageDiagnostics;
     videoDir: string;
     audioFilePath: string;
+    presenceReporterId: string;
     flushAudio: () => Promise<void>;
     destroyAudio: () => void;
   }> {
@@ -1304,6 +1677,13 @@ export class RecordingSessionManager {
       );
     });
 
+    // Idle exit: the page (useRecordingBotPresenceReporter) pushes the number
+    // of real users in the call on every change and every 30 s.
+    const presenceReporterId = uuidv4();
+    await context.exposeFunction('__reportRealParticipantCount', (count: number) => {
+      this.recordPresenceReport(workoutClassId, presenceReporterId, perspective, Number(count));
+    });
+
     const flushAudio = async () => {
       if (!page.isClosed()) {
         await withTimeout(
@@ -1350,7 +1730,7 @@ export class RecordingSessionManager {
       audioStream.destroy();
     };
 
-    return { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio };
+    return { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, presenceReporterId, flushAudio, destroyAudio };
   }
 
   private async openClientRecordingContext(
@@ -1362,7 +1742,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, presenceReporterId, flushAudio, destroyAudio } =
         await this.createRecordingContext(browser, workoutClassId, 'client');
       // Sample resource usage throughout the join — this is when crashes occur.
       diagnostics.startSampling();
@@ -1383,13 +1763,14 @@ export class RecordingSessionManager {
 
         await this.waitForSessionJoined(page, 'client', false, diagnostics);
         diagnostics.stopSampling();
-        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics, audioFilePath, flushAudio, destroyAudio };
+        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics, audioFilePath, presenceReporterId, flushAudio, destroyAudio };
       } catch (err) {
         await diagnostics.logCrashReport(
           `client join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
         await diagnostics.dispose();
         destroyAudio();
+        this.removePresenceReport(workoutClassId, presenceReporterId);
         await context.close().catch(() => undefined);
         // Discard the partial recording so it doesn't accumulate on disk.
         await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
@@ -1419,7 +1800,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, presenceReporterId, flushAudio, destroyAudio } =
         await this.createRecordingContext(browser, workoutClassId, perspective);
       diagnostics.startSampling();
 
@@ -1448,13 +1829,14 @@ export class RecordingSessionManager {
 
         await this.waitForSessionJoined(page, perspective, true, diagnostics);
         diagnostics.stopSampling();
-        return { context, page, perspective, videoRecordingStartMs, diagnostics, audioFilePath, flushAudio, destroyAudio };
+        return { context, page, perspective, videoRecordingStartMs, diagnostics, audioFilePath, presenceReporterId, flushAudio, destroyAudio };
       } catch (err) {
         await diagnostics.logCrashReport(
           `${perspective} corporate join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
         await diagnostics.dispose();
         destroyAudio();
+        this.removePresenceReport(workoutClassId, presenceReporterId);
         await context.close().catch(() => undefined);
         // Discard the partial recording so it doesn't accumulate on disk.
         await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);

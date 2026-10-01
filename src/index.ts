@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import { Queue, Worker } from 'bullmq';
+import { v4 as uuidv4 } from 'uuid';
 import { buildRedisConnection } from './redis.js';
 import {
   cleanupRecordingTmpDir,
@@ -230,7 +231,12 @@ for (const queueRole of queueRoles) {
   const stopWorker = new Worker(
     stopQueueName,
     async (job) => {
-      const { workoutClassId } = job.data as { workoutClassId: number; jobId: string };
+      const { workoutClassId, reason } = job.data as {
+        workoutClassId: number;
+        jobId: string;
+        reason?: 'idle';
+      };
+      const isIdleStop = reason === 'idle';
 
       if (stopJobsInFlight.has(workoutClassId)) {
         console.log(
@@ -240,11 +246,35 @@ for (const queueRole of queueRoles) {
       }
 
       console.log(
-        `[RecordingWorker] Stop ${joinAs} recording for class ${workoutClassId} (triggered by ${queueRole} queue)`,
+        `[RecordingWorker] Stop ${joinAs} recording for class ${workoutClassId} (triggered by ${queueRole} queue, reason: ${reason ?? 'server'})`,
       );
 
-      const hasSession = await waitForActiveSession(workoutClassId, startQueue);
+      if (isIdleStop) {
+        // Queued by this worker; the class may have been stopped normally or
+        // a user may have come back while the job waited behind other stops.
+        if (!sessionManager.hasSession(workoutClassId)) {
+          console.log(
+            `[RecordingWorker] Idle stop for class ${workoutClassId} skipped — session already closed`,
+          );
+          return;
+        }
+        if (!sessionManager.isIdleStopStillWanted(workoutClassId)) {
+          console.log(
+            `[RecordingWorker] Idle stop for class ${workoutClassId} cancelled — a real user rejoined`,
+          );
+          return;
+        }
+      }
+
+      const hasSession =
+        isIdleStop || (await waitForActiveSession(workoutClassId, startQueue));
       if (!hasSession) {
+        if (sessionManager.wasSelfStopped(workoutClassId)) {
+          console.log(
+            `[RecordingWorker] Class ${workoutClassId} was already stopped by this worker (idle/watchdog) — ignoring late ${queueRole} stop job`,
+          );
+          return;
+        }
         console.warn(
           `[RecordingWorker] No active ${joinAs} session for class ${workoutClassId} — was the worker running for the full class?`,
         );
@@ -254,7 +284,10 @@ for (const queueRole of queueRoles) {
 
       stopJobsInFlight.add(workoutClassId);
       try {
-        await sessionManager.stopClassRecording(workoutClassId);
+        await sessionManager.stopClassRecording(
+          workoutClassId,
+          isIdleStop ? 'idle' : 'job',
+        );
       } catch (err) {
         console.error(
           `[RecordingWorker] Stop processing failed for class ${workoutClassId}:`,
@@ -270,6 +303,23 @@ for (const queueRole of queueRoles) {
   );
 
   workers.push(startWorker, stopWorker);
+
+  // Idle stops go through this worker's own stop queue (the first one when
+  // JOIN_AS=all, since any of them stops the whole session) so they share the
+  // duplicate guard, lock settings and upload path of a normal stop.
+  if (queueRole === queueRoles[0]) {
+    sessionManager.setIdleStopHandler(async (workoutClassId) => {
+      const jobId = uuidv4();
+      await stopQueue.add(
+        'stop',
+        { workoutClassId, jobId, reason: 'idle' },
+        {
+          jobId: `recording-idle-stop-${queueRole}-${workoutClassId}-${jobId}`,
+          priority: 1,
+        },
+      );
+    });
+  }
 
   startWorker.on('error', (err) => {
     console.error(`[RecordingWorker] Start worker error (${queueRole}):`, err);
