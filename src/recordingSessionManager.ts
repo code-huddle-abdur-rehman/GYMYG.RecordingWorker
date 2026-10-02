@@ -117,6 +117,36 @@ const STOP_AUDIO_FLUSH_TIMEOUT_MS =
 // loops exit within one STAFF_POLL_INTERVAL_MS tick of stoppingClassIds being
 // set; the extra headroom covers a loop caught mid-join.
 const STOP_CORPORATE_SETTLE_TIMEOUT_MS = 60_000;
+// setTimeout fires immediately for delays above this (2^31 - 1 ms, ~24.8 days).
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Reads a millisecond duration from the environment, falling back to the
+ * default for unset, empty or invalid values. Number('') is 0 and
+ * Number('abc') is NaN, and setTimeout treats both as ~0 ms, so a blank env
+ * var would otherwise fire these timers immediately on every session.
+ */
+function readDurationMsEnv(
+  name: string,
+  fallbackMs: number,
+  { allowZero = false }: { allowZero?: boolean } = {},
+): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallbackMs;
+  const value = Number(raw);
+  const valid =
+    Number.isFinite(value) &&
+    (allowZero ? value >= 0 : value > 0) &&
+    value <= MAX_TIMER_DELAY_MS;
+  if (!valid) {
+    console.warn(
+      `[RecordingWorker] Invalid ${name}=${JSON.stringify(raw)} — using default ${fallbackMs} ms`,
+    );
+    return fallbackMs;
+  }
+  return value;
+}
+
 // Absolute wall-clock cap on a registered session, enforced from the moment it
 // is registered. The only other thing that closes a browser is an inbound stop
 // job, so a dropped/lost/never-enqueued stop job would otherwise leave a fully
@@ -124,14 +154,19 @@ const STOP_CORPORATE_SETTLE_TIMEOUT_MS = 60_000;
 // rather than the class's own startsAt/duration: those are opaque pass-through
 // values here (the server decides their unit), and a mis-parsed unit could
 // abort a live recording, whereas a generous fixed cap cannot.
-const SESSION_MAX_LIFETIME_MS = Number(process.env.RECORDING_SESSION_MAX_LIFETIME_MS ?? 4 * 60 * 60 * 1000);
+const SESSION_MAX_LIFETIME_MS = readDurationMsEnv(
+  'RECORDING_SESSION_MAX_LIFETIME_MS',
+  4 * 60 * 60 * 1000,
+);
 // Bots are billed Daily participants, so once no real user has been in the call
 // for this long the session stops, uploads and leaves. 0 disables the feature.
-const IDLE_TIMEOUT_MS = Number(process.env.RECORDING_IDLE_TIMEOUT_MS ?? 10 * 60 * 1000);
+const IDLE_TIMEOUT_MS = readDurationMsEnv('RECORDING_IDLE_TIMEOUT_MS', 10 * 60 * 1000, {
+  allowZero: true,
+});
 // The page re-reports its count every 30 s. A page silent for longer than this
 // (crashed, frozen) means the room state is unknown, which never counts as idle;
 // the session watchdog covers dead pages instead.
-const IDLE_REPORT_STALE_MS = Number(process.env.RECORDING_IDLE_REPORT_STALE_MS ?? 60_000);
+const IDLE_REPORT_STALE_MS = readDurationMsEnv('RECORDING_IDLE_REPORT_STALE_MS', 60_000);
 // How long to remember a class this worker stopped by itself (idle / watchdog),
 // so the server's delayed auto-stop that arrives later is treated as a no-op
 // instead of being reported as a missing session.
@@ -270,6 +305,9 @@ export class RecordingSessionManager {
 
   private activeSessions = new Map<number, ActiveSession>();
   private stoppingClassIds = new Set<number>();
+  // Classes inside startClassRecording, i.e. not yet in activeSessions. Their
+  // bot pages may already be reporting presence.
+  private startingClassIds = new Set<number>();
   private sessionWatchdogs = new Map<number, ReturnType<typeof setTimeout>>();
   // Idle exit: latest real-user count reported by each bot page, per class.
   private presenceReports = new Map<number, Map<string, PresenceReport>>();
@@ -448,6 +486,7 @@ export class RecordingSessionManager {
 
     let browser: Browser | null = null;
     const entries: ActiveSession['entries'] = [];
+    this.startingClassIds.add(workoutClassId);
 
     try {
       browser = await chromium.launch({
@@ -530,6 +569,8 @@ export class RecordingSessionManager {
       this.clearIdleTracking(workoutClassId);
       this.activeSessions.delete(workoutClassId);
       throw err;
+    } finally {
+      this.startingClassIds.delete(workoutClassId);
     }
   }
 
@@ -579,6 +620,11 @@ export class RecordingSessionManager {
         `[RecordingWorker] ${joinAs} not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — will watch for re-join`,
       );
       await this.notifyFailed(workoutClassId, joinAs);
+    } else if (!this.isSessionLive(workoutClassId, session)) {
+      // Stop gave up waiting on this setup and closed the browser already.
+      console.log(
+        `[RecordingWorker] Corporate ${joinAs} setup abandoned for class ${workoutClassId} — session already stopped`,
+      );
     } else {
       wasInCall = true;
       const liveViewRole =
@@ -606,18 +652,21 @@ export class RecordingSessionManager {
     );
 
     // ── Re-join watcher ───────────────────────────────────────────────────
-    // Keeps running until stopClassRecording signals via stoppingClassIds.
+    // Keeps running until this session is stopped (see isSessionLive).
     // When the staff member leaves, their mirror bot is closed and its segment
     // uploaded in the background. When they rejoin, a fresh recording context
     // is opened and appended to session.entries so it gets uploaded on stop.
-    while (!this.stoppingClassIds.has(workoutClassId)) {
+    while (this.isSessionLive(workoutClassId, session)) {
       await new Promise<void>((resolve) =>
         setTimeout(resolve, STAFF_POLL_INTERVAL_MS),
       );
-      if (this.stoppingClassIds.has(workoutClassId)) break;
+      if (!this.isSessionLive(workoutClassId, session)) break;
 
       try {
         const presence = await this.fetchStaffPresence(workoutClassId);
+        // The stop may have begun (and snapshotted the segment list) while the
+        // request was in flight; acting now would race its uploads and cleanup.
+        if (!this.isSessionLive(workoutClassId, session)) break;
         const isInCall =
           joinAs === 'trainer' ? presence.trainerInCall : presence.coachInCall;
 
@@ -1056,6 +1105,19 @@ export class RecordingSessionManager {
     this.sessionWatchdogs.set(workoutClassId, timer);
   }
 
+  /**
+   * True while `session` is the registered, not-stopping session for the class.
+   * Background loops check this rather than stoppingClassIds alone: a stop
+   * clears stoppingClassIds once it has waited (bounded) for those loops, so a
+   * loop it gave up on would otherwise never see the signal and run forever.
+   */
+  private isSessionLive(workoutClassId: number, session: ActiveSession): boolean {
+    return (
+      this.activeSessions.get(workoutClassId) === session &&
+      !this.stoppingClassIds.has(workoutClassId)
+    );
+  }
+
   private clearSessionWatchdog(workoutClassId: number): void {
     const timer = this.sessionWatchdogs.get(workoutClassId);
     if (!timer) return;
@@ -1098,6 +1160,13 @@ export class RecordingSessionManager {
     count: number,
   ): void {
     if (!Number.isFinite(count) || count < 0) return;
+    // Pages keep reporting until their context is closed, which during a stop
+    // is after clearIdleTracking; storing those would leak one entry per class.
+    const acceptsReports =
+      this.startingClassIds.has(workoutClassId) ||
+      (this.activeSessions.has(workoutClassId) &&
+        !this.stoppingClassIds.has(workoutClassId));
+    if (!acceptsReports) return;
     let reports = this.presenceReports.get(workoutClassId);
     if (!reports) {
       reports = new Map();
