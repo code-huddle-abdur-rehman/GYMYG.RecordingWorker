@@ -18,6 +18,7 @@ import type { JoinAsMode } from './queues.js';
 
 type Perspective = 'client' | 'coach' | 'trainer';
 type StaffRole = 'trainer' | 'coach';
+export type StopReason = 'job' | 'idle' | 'watchdog';
 
 interface JoinDetails {
   roomToken: string;
@@ -36,6 +37,8 @@ interface StaffPresence {
   leadTrainerUserId: string | null;
   assignedCoachUserId: string | null;
   participantUserIds?: string[];
+  // Only returned when requested; absent on servers that predate idle exit.
+  realParticipantCount?: number;
 }
 
 interface RecordingEntry {
@@ -45,6 +48,7 @@ interface RecordingEntry {
   videoRecordingStartMs: number;
   diagnostics: PageDiagnostics;
   audioFilePath: string;
+  presenceReporterId: string;
   flushAudio: () => Promise<void>;
   destroyAudio: () => void;
 }
@@ -53,6 +57,16 @@ interface ActiveSession {
   entries: RecordingEntry[];
   browser: Browser;
   corporateSetupPromise: Promise<void>;
+  // Segments closed mid-class (a trainer/coach left), uploading in the
+  // background. Stop waits for them before its own uploads and cleanup.
+  segmentFinalizations: Promise<void>[];
+  // Per perspective: whether any mid-class segment uploaded successfully.
+  segmentResults: Map<Perspective, boolean>;
+}
+
+interface PresenceReport {
+  count: number;
+  at: number;
 }
 
 interface AuthSession {
@@ -86,6 +100,77 @@ const RECORDING_JOIN_RETRY_DELAY_MS = 5_000;
 const STOP_AUDIO_COLLECT_TIMEOUT_MS = 60_000;
 const STOP_PAGE_OP_TIMEOUT_MS = 30_000;
 const STOP_CONTEXT_CLOSE_TIMEOUT_MS = 60_000;
+// Budget for the audio write stream to flush its buffered chunks to disk once
+// end() has been called. This MUST be bounded: an unbounded wait here blocks
+// closeRecordingContext, which blocks stopClassRecording before it reaches the
+// finally that closes Chromium. Since the stop worker runs at concurrency 1,
+// one such hang permanently occupies the only stop slot, so every subsequent
+// class leaks a live Chromium (still in the WebRTC call, still encoding) until
+// the process is restarted.
+const STOP_AUDIO_STREAM_DRAIN_TIMEOUT_MS = 30_000;
+// Outer guard for the whole flush (in-page collect + stream drain), set above
+// the sum of its two internal budgets so it only fires if something new inside
+// flushAudio blocks unexpectedly.
+const STOP_AUDIO_FLUSH_TIMEOUT_MS =
+  STOP_AUDIO_COLLECT_TIMEOUT_MS + STOP_AUDIO_STREAM_DRAIN_TIMEOUT_MS + 30_000;
+// Cap on waiting for the corporate watcher loops to settle during a stop. The
+// loops exit within one STAFF_POLL_INTERVAL_MS tick of stoppingClassIds being
+// set; the extra headroom covers a loop caught mid-join.
+const STOP_CORPORATE_SETTLE_TIMEOUT_MS = 60_000;
+// setTimeout fires immediately for delays above this (2^31 - 1 ms, ~24.8 days).
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
+
+/**
+ * Reads a millisecond duration from the environment, falling back to the
+ * default for unset, empty or invalid values. Number('') is 0 and
+ * Number('abc') is NaN, and setTimeout treats both as ~0 ms, so a blank env
+ * var would otherwise fire these timers immediately on every session.
+ */
+function readDurationMsEnv(
+  name: string,
+  fallbackMs: number,
+  { allowZero = false }: { allowZero?: boolean } = {},
+): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallbackMs;
+  const value = Number(raw);
+  const valid =
+    Number.isFinite(value) &&
+    (allowZero ? value >= 0 : value > 0) &&
+    value <= MAX_TIMER_DELAY_MS;
+  if (!valid) {
+    console.warn(
+      `[RecordingWorker] Invalid ${name}=${JSON.stringify(raw)} — using default ${fallbackMs} ms`,
+    );
+    return fallbackMs;
+  }
+  return value;
+}
+
+// Absolute wall-clock cap on a registered session, enforced from the moment it
+// is registered. The only other thing that closes a browser is an inbound stop
+// job, so a dropped/lost/never-enqueued stop job would otherwise leave a fully
+// recording Chromium alive forever. Deliberately anchored to elapsed time
+// rather than the class's own startsAt/duration: those are opaque pass-through
+// values here (the server decides their unit), and a mis-parsed unit could
+// abort a live recording, whereas a generous fixed cap cannot.
+const SESSION_MAX_LIFETIME_MS = readDurationMsEnv(
+  'RECORDING_SESSION_MAX_LIFETIME_MS',
+  4 * 60 * 60 * 1000,
+);
+// Bots are billed Daily participants, so once no real user has been in the call
+// for this long the session stops, uploads and leaves. 0 disables the feature.
+const IDLE_TIMEOUT_MS = readDurationMsEnv('RECORDING_IDLE_TIMEOUT_MS', 10 * 60 * 1000, {
+  allowZero: true,
+});
+// The page re-reports its count every 30 s. A page silent for longer than this
+// (crashed, frozen) means the room state is unknown, which never counts as idle;
+// the session watchdog covers dead pages instead.
+const IDLE_REPORT_STALE_MS = readDurationMsEnv('RECORDING_IDLE_REPORT_STALE_MS', 60_000);
+// How long to remember a class this worker stopped by itself (idle / watchdog),
+// so the server's delayed auto-stop that arrives later is treated as a no-op
+// instead of being reported as a missing session.
+const SELF_STOPPED_TTL_MS = 6 * 60 * 60 * 1000;
 
 function getRecordingResolution(): { width: number; height: number } {
   const raw = process.env.RECORDING_RESOLUTION ?? '960x540';
@@ -220,6 +305,19 @@ export class RecordingSessionManager {
 
   private activeSessions = new Map<number, ActiveSession>();
   private stoppingClassIds = new Set<number>();
+  // Classes inside startClassRecording, i.e. not yet in activeSessions. Their
+  // bot pages may already be reporting presence.
+  private startingClassIds = new Set<number>();
+  private sessionWatchdogs = new Map<number, ReturnType<typeof setTimeout>>();
+  // Idle exit: latest real-user count reported by each bot page, per class.
+  private presenceReports = new Map<number, Map<string, PresenceReport>>();
+  private idleTimers = new Map<number, ReturnType<typeof setTimeout>>();
+  // Classes whose idle stop job is queued but not yet processed. A real user
+  // joining in the meantime removes the class, which cancels that job.
+  private idleStopRequested = new Set<number>();
+  // classId → expiry time (ms).
+  private selfStoppedClassIds = new Map<number, number>();
+  private idleStopHandler: ((workoutClassId: number) => Promise<void>) | null = null;
   private s3 = new S3Client({
     region: process.env.AWS_REGION || 'us-east-1',
     followRegionRedirects: true,
@@ -388,6 +486,7 @@ export class RecordingSessionManager {
 
     let browser: Browser | null = null;
     const entries: ActiveSession['entries'] = [];
+    this.startingClassIds.add(workoutClassId);
 
     try {
       browser = await chromium.launch({
@@ -435,6 +534,8 @@ export class RecordingSessionManager {
         browser,
         entries,
         corporateSetupPromise: Promise.resolve(),
+        segmentFinalizations: [],
+        segmentResults: new Map(),
       };
 
       if (this.recordsCorporate()) {
@@ -450,18 +551,26 @@ export class RecordingSessionManager {
       }
 
       this.activeSessions.set(workoutClassId, session);
+      this.armSessionWatchdog(workoutClassId);
       browser = null;
 
       console.log(
         `[RecordingWorker] ${this.joinAs} session registered for class ${workoutClassId}`,
       );
+      // The client bot may already have reported an empty room while joining,
+      // before the session existed to arm a timer for.
+      this.evaluateIdleState(workoutClassId);
     } catch (err) {
       await this.closeEntries(entries);
       if (browser) {
-        await browser.close().catch(() => undefined);
+        await this.closeBrowserHard(browser, `class ${workoutClassId} (start failed)`);
       }
+      this.clearSessionWatchdog(workoutClassId);
+      this.clearIdleTracking(workoutClassId);
       this.activeSessions.delete(workoutClassId);
       throw err;
+    } finally {
+      this.startingClassIds.delete(workoutClassId);
     }
   }
 
@@ -471,6 +580,9 @@ export class RecordingSessionManager {
     joinAs: 'trainer' | 'coach',
   ): Promise<void> {
     let corporateAuthSession: AuthSession | null = null;
+    // The mirror bot for the staff member's current stay in the call, closed
+    // when they leave so it is not left recording (and billed) on its own.
+    let currentEntry: RecordingEntry | null = null;
 
     const openPerspective = async (
       perspective: 'trainer' | 'coach',
@@ -488,6 +600,7 @@ export class RecordingSessionManager {
         corporateAuthSession,
       );
       session.entries.push(entry);
+      currentEntry = entry;
       console.log(
         `[RecordingWorker] ${perspective} corporate browser session open for class ${workoutClassId}`,
       );
@@ -507,6 +620,11 @@ export class RecordingSessionManager {
         `[RecordingWorker] ${joinAs} not in call within ${STAFF_WAIT_TIMEOUT_MS / 1000}s for class ${workoutClassId} — will watch for re-join`,
       );
       await this.notifyFailed(workoutClassId, joinAs);
+    } else if (!this.isSessionLive(workoutClassId, session)) {
+      // Stop gave up waiting on this setup and closed the browser already.
+      console.log(
+        `[RecordingWorker] Corporate ${joinAs} setup abandoned for class ${workoutClassId} — session already stopped`,
+      );
     } else {
       wasInCall = true;
       const liveViewRole =
@@ -534,19 +652,31 @@ export class RecordingSessionManager {
     );
 
     // ── Re-join watcher ───────────────────────────────────────────────────
-    // Keeps running until stopClassRecording signals via stoppingClassIds.
-    // When the staff member leaves and rejoins, a fresh recording context is
-    // opened and appended to session.entries so it gets uploaded on stop.
-    while (!this.stoppingClassIds.has(workoutClassId)) {
+    // Keeps running until this session is stopped (see isSessionLive).
+    // When the staff member leaves, their mirror bot is closed and its segment
+    // uploaded in the background. When they rejoin, a fresh recording context
+    // is opened and appended to session.entries so it gets uploaded on stop.
+    while (this.isSessionLive(workoutClassId, session)) {
       await new Promise<void>((resolve) =>
         setTimeout(resolve, STAFF_POLL_INTERVAL_MS),
       );
-      if (this.stoppingClassIds.has(workoutClassId)) break;
+      if (!this.isSessionLive(workoutClassId, session)) break;
 
       try {
         const presence = await this.fetchStaffPresence(workoutClassId);
+        // The stop may have begun (and snapshotted the segment list) while the
+        // request was in flight; acting now would race its uploads and cleanup.
+        if (!this.isSessionLive(workoutClassId, session)) break;
         const isInCall =
           joinAs === 'trainer' ? presence.trainerInCall : presence.coachInCall;
+
+        if (!isInCall && wasInCall && currentEntry) {
+          console.log(
+            `[RecordingWorker] ${joinAs} left class ${workoutClassId} — closing their mirror bot and uploading its segment`,
+          );
+          this.finalizeDetachedSegment(workoutClassId, session, currentEntry);
+          currentEntry = null;
+        }
 
         if (isInCall && !wasInCall) {
           const liveViewRole =
@@ -610,7 +740,18 @@ export class RecordingSessionManager {
     console.log(
       `[RecordingWorker] Flushing ${perspective} audio stream for class ${workoutClassId}...`,
     );
-    await entry.flushAudio();
+    // flushAudio is internally bounded, but keep an outer guard so this call
+    // site can never become the one unbounded await in the stop path again.
+    await withTimeout(
+      entry.flushAudio(),
+      STOP_AUDIO_FLUSH_TIMEOUT_MS,
+      `${perspective} audio flush (outer) for class ${workoutClassId}`,
+    ).catch((err) => {
+      console.warn(
+        `[RecordingWorker] Audio flush exceeded its outer budget for ${perspective} class ${workoutClassId}, continuing:`,
+        err instanceof Error ? err.message : err,
+      );
+    });
 
     const audioStartMs = !pageClosed
       ? await page
@@ -712,23 +853,95 @@ export class RecordingSessionManager {
     }
   }
 
-  async stopClassRecording(workoutClassId: number): Promise<void> {
+  /**
+   * Closes a mirror bot whose staff member left the call, uploading its
+   * segment in the background so the watcher loop keeps polling for a rejoin.
+   */
+  private finalizeDetachedSegment(
+    workoutClassId: number,
+    session: ActiveSession,
+    entry: RecordingEntry,
+  ): void {
+    const index = session.entries.indexOf(entry);
+    if (index !== -1) session.entries.splice(index, 1);
+    this.removePresenceReport(workoutClassId, entry.presenceReporterId);
+
+    const work = (async () => {
+      let succeeded = false;
+      try {
+        const { videoPath, audioFilePath, audioStartMs, screenshot } =
+          await this.closeRecordingContext(entry, workoutClassId);
+        if (videoPath) {
+          await this.finalizeRecordingEntry(
+            workoutClassId,
+            entry,
+            videoPath,
+            audioFilePath,
+            audioStartMs,
+            screenshot,
+          );
+          succeeded = true;
+        }
+      } catch (err) {
+        console.error(
+          `[RecordingWorker] Error finalizing departed ${entry.perspective} segment for class ${workoutClassId}:`,
+          err,
+        );
+        await entry.diagnostics.dispose().catch(() => undefined);
+        await entry.context.close().catch(() => undefined);
+      }
+      session.segmentResults.set(
+        entry.perspective,
+        succeeded || session.segmentResults.get(entry.perspective) === true,
+      );
+    })();
+    session.segmentFinalizations.push(work);
+  }
+
+  async stopClassRecording(
+    workoutClassId: number,
+    reason: StopReason = 'job',
+  ): Promise<void> {
     const session = this.activeSessions.get(workoutClassId);
     if (!session) {
       console.log(`[RecordingWorker] No active session for class ${workoutClassId}`);
       return;
     }
+    // A stop job and a watchdog stop can overlap; only the first may proceed.
+    if (this.stoppingClassIds.has(workoutClassId)) {
+      console.log(
+        `[RecordingWorker] Stop already in progress for class ${workoutClassId} — ignoring ${reason} stop`,
+      );
+      return;
+    }
 
+    console.log(
+      `[RecordingWorker] Stopping class ${workoutClassId} (reason: ${reason})`,
+    );
     this.stoppingClassIds.add(workoutClassId);
+    this.clearSessionWatchdog(workoutClassId);
+    this.clearIdleTracking(workoutClassId);
+    if (reason !== 'job') {
+      this.markSelfStopped(workoutClassId);
+    }
 
     if (this.recordsCorporate()) {
       console.log(
         `[RecordingWorker] Waiting for corporate bot setup to finish for class ${workoutClassId}...`,
       );
-      await session.corporateSetupPromise.catch((err) => {
+      // Bounded: the watcher loop honours stoppingClassIds within one poll
+      // tick, but if it is mid-openPerspective (untimed newContext /
+      // addInitScript / exposeFunction calls against a wedged browser) this
+      // promise may never settle — which would strand the stop before the
+      // finally that closes Chromium, on a concurrency-1 worker.
+      await withTimeout(
+        session.corporateSetupPromise,
+        STOP_CORPORATE_SETTLE_TIMEOUT_MS,
+        `corporate setup settle for class ${workoutClassId}`,
+      ).catch((err) => {
         console.warn(
-          `[RecordingWorker] Corporate setup ended with error for class ${workoutClassId}:`,
-          err,
+          `[RecordingWorker] Corporate setup ended with error / did not settle for class ${workoutClassId}:`,
+          err instanceof Error ? err.message : err,
         );
       });
     }
@@ -749,6 +962,20 @@ export class RecordingSessionManager {
       // only report "failed" for perspectives where every segment failed.
       const succeededPerspectives = new Set<Perspective>();
       const attemptedPerspectives = new Set<Perspective>();
+
+      // Segments closed mid-class upload first, so the live segment's upload
+      // below is the one the server keeps. They must also finish before the
+      // finally removes this class's temp directory.
+      if (session.segmentFinalizations.length > 0) {
+        console.log(
+          `[RecordingWorker] Waiting for ${session.segmentFinalizations.length} departed segment upload(s) for class ${workoutClassId}`,
+        );
+        await Promise.allSettled(session.segmentFinalizations);
+      }
+      for (const [perspective, succeeded] of session.segmentResults) {
+        attemptedPerspectives.add(perspective);
+        if (succeeded) succeededPerspectives.add(perspective);
+      }
 
       for (const entry of entries) {
         attemptedPerspectives.add(entry.perspective);
@@ -787,16 +1014,7 @@ export class RecordingSessionManager {
         }
       }
     } finally {
-      await withTimeout(
-        session.browser.close(),
-        STOP_CONTEXT_CLOSE_TIMEOUT_MS,
-        `browser close for class ${workoutClassId}`,
-      ).catch((err) => {
-        console.error(
-          `[RecordingWorker] Failed to close browser for class ${workoutClassId}:`,
-          err,
-        );
-      });
+      await this.closeBrowserHard(session.browser, `class ${workoutClassId}`);
       console.log(`[RecordingWorker] Browser closed for class ${workoutClassId}`);
       await fs
         .rm(path.join(getRecordingTmpDir(), String(workoutClassId)), {
@@ -827,12 +1045,341 @@ export class RecordingSessionManager {
       return;
     }
     this.stoppingClassIds.add(workoutClassId);
+    this.clearSessionWatchdog(workoutClassId);
+    this.clearIdleTracking(workoutClassId);
     this.activeSessions.delete(workoutClassId);
-    await session.corporateSetupPromise.catch(() => undefined);
+    // Bounded so this path (used as the watchdog fallback and by shutdown)
+    // always reaches the browser close below.
+    await withTimeout(
+      session.corporateSetupPromise,
+      STOP_CORPORATE_SETTLE_TIMEOUT_MS,
+      `corporate setup settle for class ${workoutClassId} (force)`,
+    ).catch(() => undefined);
     this.stoppingClassIds.delete(workoutClassId);
     await this.closeEntries(session.entries);
-    await session.browser.close().catch(() => undefined);
+    await this.closeBrowserHard(session.browser, `class ${workoutClassId} (force)`);
     console.log(`[RecordingWorker] Force-closed browser for class ${workoutClassId}`);
+  }
+
+  /**
+   * Arms the safety net for a freshly registered session.
+   *
+   * An inbound stop job is otherwise the *only* thing that closes a browser, so
+   * any lost stop job (API-side failure, Redis eviction, an API deploy mid
+   * class, or a wedged stop worker) leaves a fully recording Chromium alive
+   * indefinitely. This guarantees every session is eventually reclaimed.
+   */
+  private armSessionWatchdog(workoutClassId: number): void {
+    this.clearSessionWatchdog(workoutClassId);
+
+    const timer = setTimeout(() => {
+      this.sessionWatchdogs.delete(workoutClassId);
+      if (
+        !this.activeSessions.has(workoutClassId) ||
+        this.stoppingClassIds.has(workoutClassId)
+      ) {
+        return;
+      }
+      console.error(
+        `[RecordingWorker] Watchdog: class ${workoutClassId} still active after ` +
+          `${Math.round(SESSION_MAX_LIFETIME_MS / 60_000)} min with no stop job — stopping and uploading what was recorded`,
+      );
+      // Normal stop first so the recording is uploaded and the server
+      // notified; every step in it is time-boxed. Force-close only if it fails.
+      void this.stopClassRecording(workoutClassId, 'watchdog').catch(async (err) => {
+        console.error(
+          `[RecordingWorker] Watchdog stop failed for class ${workoutClassId} — force-closing:`,
+          err,
+        );
+        await this.forceCloseSession(workoutClassId).catch((closeErr) =>
+          console.error(
+            `[RecordingWorker] Watchdog force-close failed for class ${workoutClassId}:`,
+            closeErr,
+          ),
+        );
+      });
+    }, SESSION_MAX_LIFETIME_MS);
+
+    // Never let a pending watchdog be the reason the process stays alive.
+    timer.unref?.();
+    this.sessionWatchdogs.set(workoutClassId, timer);
+  }
+
+  /**
+   * True while `session` is the registered, not-stopping session for the class.
+   * Background loops check this rather than stoppingClassIds alone: a stop
+   * clears stoppingClassIds once it has waited (bounded) for those loops, so a
+   * loop it gave up on would otherwise never see the signal and run forever.
+   */
+  private isSessionLive(workoutClassId: number, session: ActiveSession): boolean {
+    return (
+      this.activeSessions.get(workoutClassId) === session &&
+      !this.stoppingClassIds.has(workoutClassId)
+    );
+  }
+
+  private clearSessionWatchdog(workoutClassId: number): void {
+    const timer = this.sessionWatchdogs.get(workoutClassId);
+    if (!timer) return;
+    clearTimeout(timer);
+    this.sessionWatchdogs.delete(workoutClassId);
+  }
+
+  // ── Idle exit ───────────────────────────────────────────────────────────
+  // Each bot page reports how many real (non-bot, non-admin) users are in the
+  // call. When none has been present for IDLE_TIMEOUT_MS, the class is stopped
+  // through this worker's own stop queue, so the recording is still uploaded.
+
+  /** Wires the idle stop to the stop queue (owned by index.ts). */
+  setIdleStopHandler(handler: (workoutClassId: number) => Promise<void>): void {
+    this.idleStopHandler = handler;
+  }
+
+  /** False once a real user has returned after the idle stop was queued. */
+  isIdleStopStillWanted(workoutClassId: number): boolean {
+    return this.idleStopRequested.has(workoutClassId);
+  }
+
+  /** True if this worker stopped the class itself (idle or watchdog) recently. */
+  wasSelfStopped(workoutClassId: number): boolean {
+    const now = Date.now();
+    for (const [classId, expiresAt] of this.selfStoppedClassIds) {
+      if (expiresAt <= now) this.selfStoppedClassIds.delete(classId);
+    }
+    return this.selfStoppedClassIds.has(workoutClassId);
+  }
+
+  private markSelfStopped(workoutClassId: number): void {
+    this.selfStoppedClassIds.set(workoutClassId, Date.now() + SELF_STOPPED_TTL_MS);
+  }
+
+  private recordPresenceReport(
+    workoutClassId: number,
+    reporterId: string,
+    perspective: Perspective,
+    count: number,
+  ): void {
+    if (!Number.isFinite(count) || count < 0) return;
+    // Pages keep reporting until their context is closed, which during a stop
+    // is after clearIdleTracking; storing those would leak one entry per class.
+    const acceptsReports =
+      this.startingClassIds.has(workoutClassId) ||
+      (this.activeSessions.has(workoutClassId) &&
+        !this.stoppingClassIds.has(workoutClassId));
+    if (!acceptsReports) return;
+    let reports = this.presenceReports.get(workoutClassId);
+    if (!reports) {
+      reports = new Map();
+      this.presenceReports.set(workoutClassId, reports);
+    }
+    const previous = reports.get(reporterId);
+    reports.set(reporterId, { count, at: Date.now() });
+    if (previous?.count !== count) {
+      console.log(
+        `[RecordingWorker] Idle: ${perspective} bot sees ${count} real user(s) in class ${workoutClassId}`,
+      );
+    }
+    this.evaluateIdleState(workoutClassId);
+  }
+
+  private removePresenceReport(workoutClassId: number, reporterId: string): void {
+    const reports = this.presenceReports.get(workoutClassId);
+    if (!reports) return;
+    reports.delete(reporterId);
+    if (reports.size === 0) this.presenceReports.delete(workoutClassId);
+  }
+
+  /**
+   * Highest real-user count among recent reports (several bots can watch the
+   * same call), or null when no page has reported recently (state unknown).
+   */
+  private getFreshRealCount(workoutClassId: number): number | null {
+    const reports = this.presenceReports.get(workoutClassId);
+    if (!reports) return null;
+    const cutoff = Date.now() - IDLE_REPORT_STALE_MS;
+    let highest: number | null = null;
+    for (const report of reports.values()) {
+      if (report.at >= cutoff) highest = Math.max(highest ?? 0, report.count);
+    }
+    return highest;
+  }
+
+  private evaluateIdleState(workoutClassId: number): void {
+    if (IDLE_TIMEOUT_MS <= 0) return;
+    if (
+      !this.activeSessions.has(workoutClassId) ||
+      this.stoppingClassIds.has(workoutClassId)
+    ) {
+      return;
+    }
+
+    const realCount = this.getFreshRealCount(workoutClassId);
+    if (realCount === null) return;
+
+    if (realCount > 0) {
+      if (this.idleStopRequested.delete(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Idle: real user returned to class ${workoutClassId} — cancelling queued idle stop`,
+        );
+      }
+      if (this.clearIdleTimer(workoutClassId)) {
+        console.log(
+          `[RecordingWorker] Idle: real user present in class ${workoutClassId} — idle timer reset`,
+        );
+      }
+      return;
+    }
+
+    if (
+      this.idleTimers.has(workoutClassId) ||
+      this.idleStopRequested.has(workoutClassId)
+    ) {
+      return;
+    }
+    this.armIdleTimer(workoutClassId);
+  }
+
+  private armIdleTimer(workoutClassId: number): void {
+    this.clearIdleTimer(workoutClassId);
+    console.log(
+      `[RecordingWorker] Idle: no real users in class ${workoutClassId} — ` +
+        `stopping in ${Math.round(IDLE_TIMEOUT_MS / 60_000)} min unless someone joins`,
+    );
+    const timer = setTimeout(() => {
+      this.idleTimers.delete(workoutClassId);
+      void this.onIdleTimeout(workoutClassId).catch((err) =>
+        console.error(
+          `[RecordingWorker] Idle: timeout handling failed for class ${workoutClassId}:`,
+          err,
+        ),
+      );
+    }, IDLE_TIMEOUT_MS);
+    timer.unref?.();
+    this.idleTimers.set(workoutClassId, timer);
+  }
+
+  private clearIdleTimer(workoutClassId: number): boolean {
+    const timer = this.idleTimers.get(workoutClassId);
+    if (!timer) return false;
+    clearTimeout(timer);
+    this.idleTimers.delete(workoutClassId);
+    return true;
+  }
+
+  private clearIdleTracking(workoutClassId: number): void {
+    this.clearIdleTimer(workoutClassId);
+    this.idleStopRequested.delete(workoutClassId);
+    this.presenceReports.delete(workoutClassId);
+  }
+
+  private isIdleCandidate(workoutClassId: number): boolean {
+    return (
+      this.activeSessions.has(workoutClassId) &&
+      !this.stoppingClassIds.has(workoutClassId) &&
+      !this.idleTimers.has(workoutClassId) &&
+      this.getFreshRealCount(workoutClassId) === 0
+    );
+  }
+
+  private async onIdleTimeout(workoutClassId: number): Promise<void> {
+    if (
+      !this.activeSessions.has(workoutClassId) ||
+      this.stoppingClassIds.has(workoutClassId)
+    ) {
+      return;
+    }
+    if (this.getFreshRealCount(workoutClassId) === null) {
+      console.warn(
+        `[RecordingWorker] Idle: timer fired for class ${workoutClassId} but no bot has reported in ` +
+          `${Math.round(IDLE_REPORT_STALE_MS / 1000)}s — state unknown, not stopping`,
+      );
+      return;
+    }
+    if (!this.isIdleCandidate(workoutClassId)) return;
+
+    // One server-side check before acting, so a stale page cannot end a live
+    // recording.
+    let serverRealCount: number | undefined;
+    try {
+      const presence = await this.fetchStaffPresence(workoutClassId, {
+        includeRealParticipantCount: true,
+      });
+      serverRealCount = presence.realParticipantCount;
+    } catch (err) {
+      console.warn(
+        `[RecordingWorker] Idle: could not confirm presence for class ${workoutClassId} — re-arming:`,
+        err instanceof Error ? err.message : err,
+      );
+      if (this.isIdleCandidate(workoutClassId)) this.armIdleTimer(workoutClassId);
+      return;
+    }
+
+    // State may have moved while the request was in flight.
+    if (!this.isIdleCandidate(workoutClassId)) return;
+
+    if (serverRealCount === undefined) {
+      console.warn(
+        `[RecordingWorker] Idle: server did not return a real participant count for class ${workoutClassId} — relying on page reports`,
+      );
+    } else if (serverRealCount > 0) {
+      console.warn(
+        `[RecordingWorker] Idle: pages report 0 real users in class ${workoutClassId} but the server sees ${serverRealCount} — re-arming`,
+      );
+      this.armIdleTimer(workoutClassId);
+      return;
+    }
+
+    if (!this.idleStopHandler) {
+      console.warn(
+        `[RecordingWorker] Idle: no stop handler registered — cannot stop class ${workoutClassId}`,
+      );
+      return;
+    }
+
+    console.log(
+      `[RecordingWorker] Idle: class ${workoutClassId} has had no real users for ` +
+        `${Math.round(IDLE_TIMEOUT_MS / 60_000)} min — queueing stop (reason: idle)`,
+    );
+    this.idleStopRequested.add(workoutClassId);
+    try {
+      await this.idleStopHandler(workoutClassId);
+    } catch (err) {
+      this.idleStopRequested.delete(workoutClassId);
+      console.error(
+        `[RecordingWorker] Idle: failed to queue stop for class ${workoutClassId} — re-arming:`,
+        err,
+      );
+      if (this.isIdleCandidate(workoutClassId)) this.armIdleTimer(workoutClassId);
+    }
+  }
+
+  /**
+   * Single bounded path for closing a session browser.
+   *
+   * Every close site must be time-boxed: an unbounded browser.close() against
+   * a wedged Chromium blocks the caller, and on the concurrency-1 stop worker
+   * that strands the only stop slot, so every later class leaks a live
+   * Chromium (still in the WebRTC call, still encoding) until restart.
+   *
+   * Known gap: if close() times out, the OS process may survive and this
+   * process cannot reap it — chromium.launch() gives no public handle on the
+   * browser's ChildProcess (Playwright exposes process() only on
+   * BrowserServer/ElectronApplication). A true hard-kill needs either
+   * launchServer() + connect() (which changes how recordVideo artifacts are
+   * resolved) or an out-of-band pid reaper. The timeout below at least keeps
+   * the worker itself alive and loudly flags the orphan.
+   */
+  private async closeBrowserHard(browser: Browser, label: string): Promise<void> {
+    await withTimeout(
+      browser.close(),
+      STOP_CONTEXT_CLOSE_TIMEOUT_MS,
+      `browser close for ${label}`,
+    ).catch((err) => {
+      console.error(
+        `[RecordingWorker] Browser close failed/timed out for ${label} — a Chromium process may now be orphaned:`,
+        err instanceof Error ? err.message : err,
+      );
+    });
   }
 
   private async closeEntries(entries: ActiveSession['entries']): Promise<void> {
@@ -858,8 +1405,16 @@ export class RecordingSessionManager {
     return resp.json() as Promise<JoinDetails>;
   }
 
-  private async fetchStaffPresence(workoutClassId: number): Promise<StaffPresence> {
-    const url = `${this.apiBase}/class-recording/worker/staff-presence/${workoutClassId}`;
+  private async fetchStaffPresence(
+    workoutClassId: number,
+    options?: { includeRealParticipantCount?: boolean },
+  ): Promise<StaffPresence> {
+    // The real participant count costs the server a DB lookup, so it is only
+    // requested for the idle confirmation, not on every watcher poll.
+    const query = options?.includeRealParticipantCount
+      ? '?includeRealParticipantCount=true'
+      : '';
+    const url = `${this.apiBase}/class-recording/worker/staff-presence/${workoutClassId}${query}`;
     const resp = await fetch(url, {
       headers: { 'x-recording-worker-key': this.workerKey },
     });
@@ -1025,6 +1580,7 @@ export class RecordingSessionManager {
     diagnostics: PageDiagnostics;
     videoDir: string;
     audioFilePath: string;
+    presenceReporterId: string;
     flushAudio: () => Promise<void>;
     destroyAudio: () => void;
   }> {
@@ -1145,7 +1701,19 @@ export class RecordingSessionManager {
     const audioStreamDone = new Promise<void>((resolve) => {
       audioStream.on('finish', resolve);
       audioStream.on('error', () => resolve());
+      // destroy() (see destroyAudio) emits 'close' but never 'finish', so
+      // without this listener the promise would be permanently unresolvable
+      // after a destroy.
+      audioStream.on('close', () => resolve());
     });
+
+    // Idempotent: safe to call from both the page-driven hook and the
+    // worker-side flush, whichever gets there first.
+    const endAudioStream = () => {
+      if (audioStreamClosed) return;
+      audioStreamClosed = true;
+      audioStream.end();
+    };
 
     await context.exposeFunction('__saveAudioChunk', async (b64: string) => {
       if (!b64 || audioStreamClosed) return;
@@ -1170,15 +1738,19 @@ export class RecordingSessionManager {
     });
 
     await context.exposeFunction('__finishAudioRecording', async () => {
-      if (!audioStreamClosed) {
-        audioStreamClosed = true;
-        audioStream.end();
-      }
+      endAudioStream();
       await audioStreamDone;
       console.log(
         `[RecordingWorker] Audio stream closed for class ${workoutClassId} (${perspective}) — ` +
           `${(totalAudioBytes / 1024).toFixed(1)} KB on disk`,
       );
+    });
+
+    // Idle exit: the page (useRecordingBotPresenceReporter) pushes the number
+    // of real users in the call on every change and every 30 s.
+    const presenceReporterId = uuidv4();
+    await context.exposeFunction('__reportRealParticipantCount', (count: number) => {
+      this.recordPresenceReport(workoutClassId, presenceReporterId, perspective, Number(count));
     });
 
     const flushAudio = async () => {
@@ -1199,11 +1771,27 @@ export class RecordingSessionManager {
             err,
           ),
         );
-      } else if (!audioStreamClosed) {
-        audioStreamClosed = true;
-        audioStream.end();
       }
-      await audioStreamDone;
+
+      // Always end the stream from the worker side, even when the page is still
+      // open. Normally the in-page hook ends it via __finishAudioRecording, but
+      // if that evaluate timed out, threw, or the hook was never installed (the
+      // page never reached the joined state), nothing would ever call end() —
+      // and the wait below would never settle.
+      endAudioStream();
+
+      await withTimeout(
+        audioStreamDone,
+        STOP_AUDIO_STREAM_DRAIN_TIMEOUT_MS,
+        `${perspective} audio stream drain for class ${workoutClassId}`,
+      ).catch((err) => {
+        // Give up rather than block: a truncated audio file still muxes, and
+        // proceeding is strictly better than wedging the stop worker.
+        console.warn(
+          `[RecordingWorker] Audio stream did not drain for ${perspective} class ${workoutClassId}, continuing:`,
+          err instanceof Error ? err.message : err,
+        );
+      });
     };
 
     const destroyAudio = () => {
@@ -1211,7 +1799,7 @@ export class RecordingSessionManager {
       audioStream.destroy();
     };
 
-    return { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio };
+    return { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, presenceReporterId, flushAudio, destroyAudio };
   }
 
   private async openClientRecordingContext(
@@ -1223,7 +1811,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, presenceReporterId, flushAudio, destroyAudio } =
         await this.createRecordingContext(browser, workoutClassId, 'client');
       // Sample resource usage throughout the join — this is when crashes occur.
       diagnostics.startSampling();
@@ -1244,13 +1832,14 @@ export class RecordingSessionManager {
 
         await this.waitForSessionJoined(page, 'client', false, diagnostics);
         diagnostics.stopSampling();
-        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics, audioFilePath, flushAudio, destroyAudio };
+        return { context, page, perspective: 'client', videoRecordingStartMs, diagnostics, audioFilePath, presenceReporterId, flushAudio, destroyAudio };
       } catch (err) {
         await diagnostics.logCrashReport(
           `client join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
         await diagnostics.dispose();
         destroyAudio();
+        this.removePresenceReport(workoutClassId, presenceReporterId);
         await context.close().catch(() => undefined);
         // Discard the partial recording so it doesn't accumulate on disk.
         await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
@@ -1280,7 +1869,7 @@ export class RecordingSessionManager {
     let lastError: unknown;
 
     for (let attempt = 1; attempt <= RECORDING_JOIN_ATTEMPTS; attempt++) {
-      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, flushAudio, destroyAudio } =
+      const { context, page, videoRecordingStartMs, diagnostics, videoDir, audioFilePath, presenceReporterId, flushAudio, destroyAudio } =
         await this.createRecordingContext(browser, workoutClassId, perspective);
       diagnostics.startSampling();
 
@@ -1309,13 +1898,14 @@ export class RecordingSessionManager {
 
         await this.waitForSessionJoined(page, perspective, true, diagnostics);
         diagnostics.stopSampling();
-        return { context, page, perspective, videoRecordingStartMs, diagnostics, audioFilePath, flushAudio, destroyAudio };
+        return { context, page, perspective, videoRecordingStartMs, diagnostics, audioFilePath, presenceReporterId, flushAudio, destroyAudio };
       } catch (err) {
         await diagnostics.logCrashReport(
           `${perspective} corporate join attempt ${attempt} failed: ${err instanceof Error ? err.message : String(err)}`,
         );
         await diagnostics.dispose();
         destroyAudio();
+        this.removePresenceReport(workoutClassId, presenceReporterId);
         await context.close().catch(() => undefined);
         // Discard the partial recording so it doesn't accumulate on disk.
         await fs.rm(videoDir, { recursive: true, force: true }).catch(() => undefined);
